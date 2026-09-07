@@ -1176,6 +1176,78 @@ async function handleExecuteWorkflow(args: any): Promise<any> {
       }
     }
 
+    // ── wave-analysis runs in obs-api, not in a spawned child ──────────────
+    //
+    // km-core's LevelDB is single-owner-rw and obs-api owns it for the life of
+    // that process. A child spawned from here cannot open it: every
+    // wave-analysis run after the Plan 44-12 cutover (2026-06-04) exited 1 one
+    // second in with "Database failed to open". Hand the run to the owner over
+    // HTTP instead — it executes the same run-wave-analysis.ts against its own
+    // open store and writes the same progress file, so the dashboard, the
+    // status tool and the [📚] badge all see an unchanged shape.
+    //
+    // Deliberately NOT falling back to the spawn path when obs-api is
+    // unreachable: that fallback is precisely the run that fails a second later
+    // with an error naming the database rather than the daemon, which is what
+    // made this take three months to notice. Fail here, naming the cause.
+    if (resolvedWorkflowName === 'wave-analysis') {
+      const obsApiUrl = process.env.OBS_API_URL || 'http://host.docker.internal:12436';
+      const runUrl = `${obsApiUrl}/api/workflows/wave-analysis/run`;
+      try {
+        const resp = await fetch(runUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({ team: resolvedParameters?.team || 'coding' }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (!resp.ok) {
+          throw new Error(`obs-api returned HTTP ${resp.status}`);
+        }
+        const body = await resp.json() as { jobId?: number; attached?: boolean };
+        log('wave-analysis dispatched to obs-api (in-process on the owned store)', 'info', {
+          runUrl, jobId: body.jobId, attached: body.attached,
+        });
+        return {
+          content: [{
+            type: 'text' as const,
+            text: [
+              '# Workflow Started (obs-api, in-process)',
+              '',
+              `**Workflow:** wave-analysis`,
+              `**Job:** ${body.jobId ?? 'unknown'}${body.attached ? ' (attached to an in-flight run)' : ''}`,
+              `**Host:** ${obsApiUrl}`,
+              '',
+              'Runs inside obs-api because it owns the km-core store.',
+              'Progress: `.data/workflow-progress.json`, `semantic workflow status`,',
+              'or GET /api/workflows/wave-analysis/status on obs-api.',
+            ].join('\n'),
+          }],
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        log('wave-analysis dispatch to obs-api failed', 'error', { runUrl, error: msg });
+        return {
+          content: [{
+            type: 'text' as const,
+            text: [
+              '# Workflow NOT started',
+              '',
+              `Could not reach obs-api at ${runUrl}: ${msg}`,
+              '',
+              'wave-analysis runs inside obs-api because km-core\'s LevelDB is',
+              'single-owner and obs-api holds it. Check the daemon:',
+              '',
+              '```',
+              'launchctl list | grep com.coding.obs-api',
+              'curl -s localhost:12436/health',
+              '```',
+            ].join('\n'),
+          }],
+          isError: true,
+        };
+      }
+    }
+
     // Store workflow info locally (for status queries before child writes progress)
     const workflowInfo: RunningWorkflow = {
       id: workflowId,

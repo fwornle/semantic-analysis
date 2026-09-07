@@ -407,16 +407,19 @@ async function main(): Promise<void> {
   // Register progress file subscriber -- writes WorkflowState to disk on every transition
   const unsubscribeProgressFile = subscribe(createProgressFileSubscriber(progressFile));
 
+  // Read debug settings from progress file if they were pre-set by tools.ts.
+  // Hoisted out of the try below: the wave-analysis branch forwards the same
+  // resolved config to run-wave-analysis, so `ukb debug` keeps its behaviour
+  // on both paths.
+  let presetConfig: Record<string, any> = {};
+  if (fs.existsSync(progressFile)) {
+    try {
+      presetConfig = JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
+    } catch { /* ignore */ }
+  }
+
   // Dispatch start event to the runner's state machine instance
   try {
-    // Read debug settings from progress file if they were pre-set by tools.ts
-    let presetConfig: Record<string, any> = {};
-    if (fs.existsSync(progressFile)) {
-      try {
-        presetConfig = JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
-      } catch { /* ignore */ }
-    }
-
     dispatch({
       type: 'start',
       config: {
@@ -449,96 +452,42 @@ async function main(): Promise<void> {
     }
   }
 
-  // Wave-analysis routing -- separate from coordinator path
+  // Wave-analysis routing -- separate from coordinator path.
+  //
+  // The run itself lives in run-wave-analysis.ts because obs-api runs the same
+  // workflow in-process (km-core's LevelDB is single-owner, so a run spawned
+  // out here cannot open it while obs-api holds the lock). This path keeps
+  // working wherever nothing else owns the store — it just passes no kmStore,
+  // so WaveController opens a private one exactly as before.
   if (workflowName === 'wave-analysis') {
-    // eslint-disable-next-line @typescript-eslint/no-explicit-any
-    const { WaveController } = await import('./agents/wave-controller.js' as any);
-    const waveController = new WaveController({
+    const { runWaveAnalysis } = await import('./run-wave-analysis.js');
+
+    // run-wave-analysis owns the state machine and the terminal write, so the
+    // runner's own progress subscriber must stand down first or the two would
+    // both write the terminal state.
+    unsubscribeProgressFile();
+
+    const result = await runWaveAnalysis({
       repositoryPath,
       team: parameters?.team || 'coding',
-      progressFile
+      progressFile,
+      // Carry the debug config the runner already resolved, so `ukb debug`
+      // still single-steps and mocks on this path.
+      config: {
+        singleStepMode: presetConfig.singleStepMode || parameters?.singleStepMode || false,
+        mockLLM: presetConfig.mockLLM || parameters?.mockLLM || false,
+        llmMode: presetConfig.llmState?.globalMode || parameters?.llmMode || 'public',
+        stepIntoSubsteps: presetConfig.stepIntoSubsteps || parameters?.stepIntoSubsteps || false,
+      },
     });
 
-    // Heartbeat removed -- the subscriber writes on every transition (~30 per run),
-    // and wave-controller's frequent transitions serve as natural heartbeats.
-    // If no transition occurs for >60s, that's a real hang, not a heartbeat issue.
-
-    try {
-      const result = await waveController.execute();
-
-      // Dispatch complete or fail event via state machine
-      const completeSummary = {
-        totalEntities: result.totalEntities,
-        waves: result.waves.length,
-        message: `Wave analysis completed: ${result.totalEntities} entities across ${result.waves.length} waves`,
-      };
-      if (result.success) {
-        try {
-          dispatch({
-            type: 'complete',
-            summary: completeSummary,
-          });
-        } catch (err) {
-          if (!(err instanceof InvalidTransitionError)) throw err;
-        }
-        saveTraceHistory(repositoryPath, progressFile, 'wave-analysis');
-      } else {
-        try {
-          dispatch({
-            type: 'fail',
-            error: 'Wave analysis completed with errors',
-            step: 'wave-analysis',
-          });
-        } catch (err) {
-          if (!(err instanceof InvalidTransitionError)) throw err;
-        }
-      }
-
-      // Phase 42 Plan 07 — SC#4 single-writer terminal-state guarantee.
-      // The state-machine `dispatch` above may have silently swallowed an
-      // InvalidTransitionError, leaving status='running' in the progress
-      // file (RESEARCH §2 fix #1; 42-02-VERIFY-FAIL.md captured this
-      // exact failure mode). Force the terminal-state write synchronously
-      // — preserving the user-control fields the subscriber owns — so
-      // the dashboard sees the terminal state before process.exit().
-      // Unsubscribe FIRST so this write isn't followed by a stale
-      // subscriber-driven overwrite from a leftover async transition.
-      unsubscribeProgressFile();
-      if (result.success) {
-        writeTerminalState(progressFile, 'completed', completeSummary);
-      } else {
-        writeTerminalState(progressFile, 'failed', undefined, {
-          error: 'Wave analysis completed with errors',
-          step: 'wave-analysis',
-        });
-      }
-
-      // Clean up
-      try { fs.unlinkSync(pidFile); } catch (e) { /* ignore */ }
-      try { fs.unlinkSync(configPath); } catch (e) { /* ignore */ }
-      process.exit(result.success ? 0 : 1);
-    } catch (error) {
-      const errorMessage = error instanceof Error ? error.message : String(error);
-
-      // Dispatch fail event via state machine
-      try {
-        dispatch({ type: 'fail', error: errorMessage, step: 'wave-analysis' });
-      } catch (err) {
-        if (!(err instanceof InvalidTransitionError)) throw err;
-      }
-
-      // Phase 42 Plan 07 — SC#4 single-writer terminal-state guarantee
-      // (failure path). Same rationale as the success path above.
-      unsubscribeProgressFile();
-      writeTerminalState(progressFile, 'failed', undefined, {
-        error: errorMessage,
-        step: 'wave-analysis',
-      });
-
-      try { fs.unlinkSync(pidFile); } catch (e) { /* ignore */ }
-      try { fs.unlinkSync(configPath); } catch (e) { /* ignore */ }
-      process.exit(1);
+    if (result.success) {
+      saveTraceHistory(repositoryPath, progressFile, 'wave-analysis');
     }
+
+    try { fs.unlinkSync(pidFile); } catch (e) { /* ignore */ }
+    try { fs.unlinkSync(configPath); } catch (e) { /* ignore */ }
+    process.exit(result.success ? 0 : 1);
   }
 
   const coordinator = new CoordinatorAgent(repositoryPath);
@@ -684,12 +633,12 @@ main().then(() => {
   process.stderr.write(`[workflow-runner] Fatal error: ${errMsg}\n`);
   log('Fatal error in workflow runner', 'error', { message: e instanceof Error ? e.message : String(e), stack: e instanceof Error ? e.stack : undefined });
 
-  // Phase 42 Plan 07 — SC#4 belt-and-braces extension. The wave-analysis
-  // branch's inner try/catch only covers the body AFTER `new WaveController()`
-  // returns. Errors fired BEFORE the wave-analysis branch (e.g., the
-  // WaveController constructor itself throwing — exactly the Surprise #5
-  // failure mode where the constructor's now-fixed CommonJS require() blew
-  // up under ESM) escape that try/catch and land here. Without this
+  // Phase 42 Plan 07 — SC#4 belt-and-braces extension. runWaveAnalysis()
+  // catches everything the run itself throws and writes its own terminal
+  // state, but errors fired BEFORE the wave-analysis branch is reached (config
+  // parsing, the state-machine start, the dynamic import itself — the
+  // Surprise #5 mode was the WaveController constructor's now-fixed CommonJS
+  // require() blowing up under ESM) still escape to here. Without this
   // write, the progress file stays `status: 'running'` forever from the
   // dashboard's perspective (Plan 02 VERIFY-FAIL.md captured this exact
   // mode at 12:35:07Z).

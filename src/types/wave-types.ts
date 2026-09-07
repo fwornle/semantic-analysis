@@ -120,7 +120,35 @@ export interface WaveControllerConfig {
   maxAgentsPerWave?: number;
   /** If true, abort remaining waves when any agent fails (default: true) */
   failFast?: boolean;
+  /**
+   * An already-open km-core GraphKMStore owned by the CALLER.
+   *
+   * km-core's LevelDB is single-owner-rw: obs-api
+   * (scripts/observations-api-server.mjs) holds the lock on
+   * .data/knowledge-graph/leveldb for the life of the process, and every other
+   * consumer is expected to reach the store through it. A WaveController
+   * running in its own process therefore cannot open the DB at all — it fails
+   * at bootstrap with "Database failed to open", which is what silently killed
+   * every wave-analysis run after the Plan 44-12 cutover (2026-06-04).
+   *
+   * Pass the owner's store to run in-process instead. When set, WaveController
+   * uses it as-is and never opens or closes it — the owner's lifecycle wins.
+   * When unset the old behaviour stands: construct and open a private store,
+   * which still works wherever nothing else holds the lock.
+   */
+  kmStore?: KmStoreHandle;
 }
+
+/**
+ * An open km-core GraphKMStore, structurally typed.
+ *
+ * Deliberately not `import('@fwornle/km-core').GraphKMStore`: this type is
+ * consumed by a plain-JS host process (obs-api) that already holds a store
+ * instance, and a nominal import here would drag km-core's types into every
+ * consumer of wave-types for no benefit. WaveController only ever hands the
+ * value to createKmCoreAdapter().
+ */
+export type KmStoreHandle = object;
 
 // ============================================================================
 // Child Manifest Entry

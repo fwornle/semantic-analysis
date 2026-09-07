@@ -95,6 +95,8 @@ export class WaveController {
    * retired). Bootstrapped in execute() before any wave runs.
    */
   private kmCoreAdapter?: KmCoreAdapter;
+  /** Caller-owned km-core store, when running in the owner's process. */
+  private injectedKmStore?: object;
   private reportAgent: WorkflowReportAgent;
   private qaAgent: QualityAssuranceAgent;
   /** Per-step LLM metrics and outputs accumulated during execution */
@@ -132,6 +134,7 @@ export class WaveController {
     this.progressFile = config.progressFile;
     this.maxAgentsPerWave = config.maxAgentsPerWave ?? 4;
     this.failFast = config.failFast ?? true;
+    this.injectedKmStore = config.kmStore;
 
     // Phase 42.2 Plan 04 — km-core adapter is bootstrapped inside execute()
     // (it requires an async store.open()). this.kmCoreAdapter is undefined
@@ -547,22 +550,35 @@ export class WaveController {
       // Phase 42-07 Phase A transitional measure; Plan 05 collapsed the two
       // dirs into the single canonical location and reverted this path.)
       try {
-        const km = await import('@fwornle/km-core');
-        const dbPath = path.join(this.repositoryPath, '.data', 'knowledge-graph', 'leveldb');
-        const exportDir = path.join(this.repositoryPath, '.data', 'knowledge-graph', 'exports');
-        const ontologyDir = path.join(this.repositoryPath, '.data', 'ontologies');
-        const store = new km.GraphKMStore({
-          dbPath,
-          exportDir,
-          ontologyDir,
-          domains: [this.team],
-          debounceMs: 5000,
-        });
-        await store.open();
-        this.kmCoreAdapter = createKmCoreAdapter({ store, team: this.team });
-        log('[WaveController] km-core adapter initialized (unconditional)', 'info', {
-          dbPath, exportDir, ontologyDir,
-        });
+        if (this.injectedKmStore) {
+          // In-process run inside the store's owner (obs-api). The store is
+          // already open and stays open after we finish — do NOT open or close
+          // it here. See WaveControllerConfig.kmStore for why this exists.
+          this.kmCoreAdapter = createKmCoreAdapter({
+            store: this.injectedKmStore as never,
+            team: this.team,
+          });
+          log('[WaveController] km-core adapter initialized (caller-owned store)', 'info', {
+            owner: 'injected',
+          });
+        } else {
+          const km = await import('@fwornle/km-core');
+          const dbPath = path.join(this.repositoryPath, '.data', 'knowledge-graph', 'leveldb');
+          const exportDir = path.join(this.repositoryPath, '.data', 'knowledge-graph', 'exports');
+          const ontologyDir = path.join(this.repositoryPath, '.data', 'ontologies');
+          const store = new km.GraphKMStore({
+            dbPath,
+            exportDir,
+            ontologyDir,
+            domains: [this.team],
+            debounceMs: 5000,
+          });
+          await store.open();
+          this.kmCoreAdapter = createKmCoreAdapter({ store, team: this.team });
+          log('[WaveController] km-core adapter initialized (private store)', 'info', {
+            dbPath, exportDir, ontologyDir,
+          });
+        }
       } catch (e) {
         // Bootstrap failure is now fatal — the legacy persistence-agent path
         // was removed in Phase B1. Surface to the caller so the workflow
