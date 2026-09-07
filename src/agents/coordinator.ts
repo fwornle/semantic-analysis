@@ -168,6 +168,113 @@ export interface WorkflowStep {
   substeps?: string[]; // Sub-step names reported during execution (for progress visibility)
 }
 
+/**
+ * The four batch-derived counters in the UKB progress summary.
+ */
+export interface BatchDerivedCounts {
+  totalCommits: number;
+  totalFiles: number;
+  totalSessions: number;
+  totalObservations: number;
+}
+
+/** Minimal shape this aggregation needs from a `stepsDetail` entry. */
+export interface CountableStep {
+  name: string;
+  outputs?: Record<string, any> | null;
+}
+
+/** Minimal shape this aggregation needs from an `execution.batchIterations` entry. */
+export interface CountableBatchIteration {
+  batchId: string;
+  steps: Array<CountableStep>;
+}
+
+/** outputs[] key -> summary counter it feeds. */
+const BATCH_COUNT_KEYS: ReadonlyArray<[string, keyof BatchDerivedCounts]> = [
+  ['commitsCount', 'totalCommits'],
+  ['filesCount', 'totalFiles'],
+  ['sessionsCount', 'totalSessions'],
+  ['observationsCount', 'totalObservations'],
+];
+
+/**
+ * Sum the batch-derived counters for the progress summary.
+ *
+ * ── Why this is not a plain sum over `stepsDetail` ─────────────────────────
+ * `stepsDetail` is rebuilt from `execution.results` on every progress write,
+ * and for a batch workflow it only ever describes the CURRENT batch:
+ * `resetBatchPhaseSteps()` deletes the batch-phase results at each batch
+ * boundary, and what survives is filtered by `batchId`. Summing over it gave
+ * a counter named `totalCommits` that actually reported "commits in the batch
+ * being processed right now" — and 0 for the whole window between the reset
+ * and the next `extract_batch_commits`, which is where the summary spends a
+ * large part of every run.
+ *
+ * `execution.batchIterations` is the durable per-batch record: one entry per
+ * batch processed in this run, never reset, carrying each step's outputs. So
+ * the run total is:
+ *
+ *   every batch iteration  +  the `stepsDetail` steps that are NOT batch steps
+ *
+ * The second term keeps finalization steps counted; excluding batch steps from
+ * it is what prevents the in-flight batch being counted twice (it is already
+ * in `batchIterations`).
+ *
+ * A step may be tracked more than once within a batch (retries), so entries
+ * are deduplicated per (batchId, stepName) with last-wins before summing.
+ *
+ * With no batch iterations at all — every non-batch DAG workflow — this
+ * degrades to the plain sum over `stepsDetail` that came before.
+ *
+ * @param stepsDetail      Steps as assembled for the progress file.
+ * @param batchIterations  `execution.batchIterations`, if this is a batch run.
+ * @param batchStepNames   Step names owned by the batch phase (incl. substeps).
+ */
+export function aggregateBatchDerivedCounts(
+  stepsDetail: ReadonlyArray<CountableStep>,
+  batchIterations: ReadonlyArray<CountableBatchIteration> | undefined,
+  batchStepNames: ReadonlySet<string>,
+): BatchDerivedCounts {
+  const totals: BatchDerivedCounts = {
+    totalCommits: 0,
+    totalFiles: 0,
+    totalSessions: 0,
+    totalObservations: 0,
+  };
+
+  const add = (outputs: Record<string, any> | null | undefined): void => {
+    if (!outputs) return;
+    for (const [key, counter] of BATCH_COUNT_KEYS) {
+      const value = outputs[key];
+      if (typeof value === 'number' && Number.isFinite(value)) {
+        totals[counter] += value;
+      }
+    }
+  };
+
+  const hasBatches = Array.isArray(batchIterations) && batchIterations.length > 0;
+
+  if (hasBatches) {
+    // Last-wins per (batchId, stepName) so a retried step counts once.
+    const perBatchStep = new Map<string, Record<string, any> | null | undefined>();
+    for (const iteration of batchIterations!) {
+      for (const step of iteration.steps || []) {
+        perBatchStep.set(`${iteration.batchId}\u0000${step.name}`, step.outputs);
+      }
+    }
+    for (const outputs of perBatchStep.values()) add(outputs);
+  }
+
+  for (const step of stepsDetail) {
+    // When batches are present their steps are already counted above.
+    if (hasBatches && batchStepNames.has(step.name)) continue;
+    add(step.outputs);
+  }
+
+  return totals;
+}
+
 export interface WorkflowExecution {
   id: string;
   workflow: string;
@@ -495,14 +602,19 @@ export class CoordinatorAgent {
         skippedReasons: {} as Record<string, string>
       };
 
+      // Batch-derived counters come from the durable per-batch record, not from
+      // stepsDetail — see aggregateBatchDerivedCounts for why summing stepsDetail
+      // reported the current batch (and 0 for much of every run) under a name
+      // that promises the run total.
+      Object.assign(
+        summaryStats,
+        aggregateBatchDerivedCounts(stepsDetail, execution.batchIterations, batchSpecificSteps),
+      );
+
       for (const step of stepsDetail) {
         const outputs = step.outputs || {};
 
         // Aggregate counts
-        if (outputs.commitsCount) summaryStats.totalCommits += outputs.commitsCount;
-        if (outputs.filesCount) summaryStats.totalFiles += outputs.filesCount;
-        if (outputs.sessionsCount) summaryStats.totalSessions += outputs.sessionsCount;
-        if (outputs.observationsCount) summaryStats.totalObservations += outputs.observationsCount;
         if (outputs.totalInsights) summaryStats.totalInsights += outputs.totalInsights;
         if (outputs.totalPatterns) summaryStats.totalPatterns += outputs.totalPatterns;
 
@@ -2597,8 +2709,16 @@ export class CoordinatorAgent {
             author: c.author || c.authorName,
             date: c.date
           })) || [];
+          // Files touched across this batch's commits. Mirrors what
+          // summarizeStepResult() derives for stepsDetail, but recorded on the
+          // batch iteration so the run total survives resetBatchPhaseSteps().
+          const totalBatchFiles = (commits?.commits || []).reduce(
+            (sum: number, c: any) => sum + (Array.isArray(c.files) ? c.files.length : 0),
+            0
+          );
           trackBatchStep('extract_batch_commits', 'completed', commitsDuration, {
             commitsCount: totalCommits,
+            filesCount: totalBatchFiles,
             commits: shownCommits,
             // Show truncation indicator when commits exceed display limit
             commitsShowing: totalCommits > displayLimit ? `${displayLimit} of ${totalCommits} (...)` : `${totalCommits} of ${totalCommits}`,
