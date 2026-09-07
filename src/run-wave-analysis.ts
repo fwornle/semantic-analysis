@@ -26,6 +26,7 @@
  */
 
 import * as fs from 'fs';
+import * as path from 'path';
 
 import {
   dispatch,
@@ -72,6 +73,114 @@ export interface RunWaveAnalysisResult {
   waves: number;
   /** Present when the run threw rather than completing with errors. */
   error?: string;
+}
+
+/**
+ * Read the progress file while it is still complete.
+ *
+ * This MUST happen before writeTerminalState(): the terminal write rebuilds
+ * the file from a field allowlist that does NOT include `stepsDetail`, so a
+ * snapshot taken afterwards records a run with no steps in it. That ordering
+ * bug is why trace files carry aggregate zeroes.
+ */
+function readProgressSnapshot(progressFile: string): Record<string, unknown> | null {
+  try {
+    return JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * Save a completed run's trace data to .data/trace-history/ for historical
+ * comparison, keeping only the last 10 files.
+ *
+ * Lives here rather than in workflow-runner because both callers need it:
+ * the runner used to own it, so the obs-api path wrote a workflow report but
+ * no trace and the dashboard's History tab stayed empty for in-process runs.
+ *
+ * Never throws — trace history must not fail the workflow.
+ */
+export function saveTraceHistory(
+  repositoryPath: string,
+  progressData: Record<string, unknown> | null,
+  workflowName: string,
+  logLine: (message: string) => void,
+  /**
+   * Terminal status to record. The snapshot is taken before the terminal
+   * write (that is the only moment stepsDetail still exists), so its own
+   * `status` field still reads 'running' — recording that would label every
+   * completed run as unfinished in the History tab.
+   */
+  terminalStatus: string = 'completed',
+): void {
+  try {
+    if (!progressData) return;
+
+    const stepsDetail = (progressData.stepsDetail as Array<Record<string, never>> | undefined) || [];
+
+    // Aggregate totals from stepsDetail
+    let totalLLMCalls = 0;
+    let totalTokens = 0;
+    const entityCounts: Record<string, number> = {};
+
+    for (const step of stepsDetail as unknown as Array<Record<string, unknown>>) {
+      if (step.llmCalls) totalLLMCalls += step.llmCalls as number;
+      if (step.tokensUsed) totalTokens += step.tokensUsed as number;
+      // Aggregate LLM calls from llmCallEvents if present
+      if (Array.isArray(step.llmCallEvents)) {
+        totalLLMCalls += step.llmCallEvents.length;
+        for (const call of step.llmCallEvents as Array<Record<string, number>>) {
+          totalTokens += (call.tokensIn || 0) + (call.tokensOut || 0);
+        }
+      }
+      // Get entity counts from each step's entityFlow
+      if (step.entityFlow) {
+        const flow = step.entityFlow as Record<string, number>;
+        entityCounts[step.name as string] = flow.persisted || flow.produced || 0;
+      }
+    }
+
+    const traceData = {
+      workflowName,
+      startTime: progressData.startTime,
+      endTime: progressData.lastUpdate,
+      status: terminalStatus,
+      totalLLMCalls,
+      totalTokens,
+      entityCounts,
+      stepsDetail,
+    };
+
+    const traceDir = path.join(repositoryPath, '.data', 'trace-history');
+    if (!fs.existsSync(traceDir)) {
+      fs.mkdirSync(traceDir, { recursive: true });
+    }
+
+    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
+    const traceFile = path.join(traceDir, `${timestamp}-${workflowName}.json`);
+    fs.writeFileSync(traceFile, JSON.stringify(traceData, null, 2));
+    logLine(`[run-wave-analysis] trace history saved: ${traceFile}`);
+
+    // Cleanup: keep only the last 10 trace files (timestamp prefix sorts
+    // alphabetically = chronologically).
+    const files = fs.readdirSync(traceDir).filter((f) => f.endsWith('.json')).sort();
+    if (files.length > 10) {
+      for (const file of files.slice(0, files.length - 10)) {
+        try {
+          fs.unlinkSync(path.join(traceDir, file));
+        } catch {
+          // Ignore deletion errors
+        }
+      }
+    }
+  } catch (e) {
+    logLine(
+      `[run-wave-analysis] failed to save trace history (non-fatal): ${
+        e instanceof Error ? e.message : String(e)
+      }`,
+    );
+  }
 }
 
 /**
@@ -125,6 +234,11 @@ export async function runWaveAnalysis(
     });
 
     const result = await controller.execute();
+
+    // Snapshot the progress file while stepsDetail is still on it — the
+    // terminal write below drops everything outside its allowlist.
+    const progressSnapshot = readProgressSnapshot(progressFile);
+
     const summary = {
       totalEntities: result.totalEntities,
       waves: result.waves.length,
@@ -155,6 +269,10 @@ export async function runWaveAnalysis(
         error: 'Wave analysis completed with errors',
         step: 'wave-analysis',
       });
+    }
+
+    if (result.success) {
+      saveTraceHistory(repositoryPath, progressSnapshot, 'wave-analysis', logLine, 'completed');
     }
 
     return { success: result.success, totalEntities: summary.totalEntities, waves: summary.waves };

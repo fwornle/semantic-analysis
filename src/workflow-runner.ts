@@ -277,87 +277,6 @@ function logMemoryUsage(context: string): void {
   log(`MEMORY (${context}): heap=${formatMB(mem.heapUsed)}/${formatMB(mem.heapTotal)}, rss=${formatMB(mem.rss)}, external=${formatMB(mem.external)}`, 'debug');
 }
 
-/**
- * Save a completed workflow's trace data to .data/trace-history/ for historical comparison.
- * Keeps only the last 10 trace files (oldest deleted).
- * Never throws -- trace history saving must not fail the workflow.
- */
-function saveTraceHistory(repositoryPath: string, progressFile: string, workflowName: string): void {
-  try {
-    if (!fs.existsSync(progressFile)) return;
-
-    const progressData = JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
-    const stepsDetail = progressData.stepsDetail || [];
-
-    // Aggregate totals from stepsDetail
-    let totalLLMCalls = 0;
-    let totalTokens = 0;
-    const entityCounts: Record<string, number> = {};
-
-    for (const step of stepsDetail) {
-      if (step.llmCalls) totalLLMCalls += step.llmCalls;
-      if (step.tokensUsed) totalTokens += step.tokensUsed;
-      // Aggregate LLM calls from llmCallEvents if present
-      if (step.llmCallEvents && Array.isArray(step.llmCallEvents)) {
-        totalLLMCalls += step.llmCallEvents.length;
-        for (const call of step.llmCallEvents) {
-          totalTokens += (call.tokensIn || 0) + (call.tokensOut || 0);
-        }
-      }
-      // Get entity counts from the last persist step's entityFlow
-      if (step.entityFlow) {
-        entityCounts[step.name] = step.entityFlow.persisted || step.entityFlow.produced || 0;
-      }
-    }
-
-    const traceData = {
-      workflowName,
-      startTime: progressData.startTime,
-      endTime: progressData.lastUpdate,
-      status: progressData.status,
-      totalLLMCalls,
-      totalTokens,
-      entityCounts,
-      stepsDetail,
-    };
-
-    // Ensure trace history directory exists
-    const traceDir = path.join(repositoryPath, '.data', 'trace-history');
-    if (!fs.existsSync(traceDir)) {
-      fs.mkdirSync(traceDir, { recursive: true });
-    }
-
-    // Write trace file with ISO timestamp prefix
-    const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-    const traceFile = path.join(traceDir, `${timestamp}-${workflowName}.json`);
-    fs.writeFileSync(traceFile, JSON.stringify(traceData, null, 2));
-
-    log('[WorkflowRunner] Trace history saved', 'info', { file: traceFile });
-
-    // Cleanup: keep only last 10 trace files
-    const files = fs.readdirSync(traceDir)
-      .filter(f => f.endsWith('.json'))
-      .sort(); // Sorted by timestamp prefix (alphabetical = chronological)
-
-    if (files.length > 10) {
-      const toDelete = files.slice(0, files.length - 10);
-      for (const file of toDelete) {
-        try {
-          fs.unlinkSync(path.join(traceDir, file));
-          log('[WorkflowRunner] Deleted old trace file', 'debug', { file });
-        } catch (e) {
-          // Ignore deletion errors
-        }
-      }
-    }
-  } catch (e) {
-    // Non-fatal: trace history saving must never fail the workflow
-    log('[WorkflowRunner] Failed to save trace history (non-fatal)', 'warning', {
-      error: e instanceof Error ? e.message : String(e),
-    });
-  }
-}
-
 async function main(): Promise<void> {
   const configPath = process.argv[2];
 
@@ -480,10 +399,6 @@ async function main(): Promise<void> {
         stepIntoSubsteps: presetConfig.stepIntoSubsteps || parameters?.stepIntoSubsteps || false,
       },
     });
-
-    if (result.success) {
-      saveTraceHistory(repositoryPath, progressFile, 'wave-analysis');
-    }
 
     try { fs.unlinkSync(pidFile); } catch (e) { /* ignore */ }
     try { fs.unlinkSync(configPath); } catch (e) { /* ignore */ }
