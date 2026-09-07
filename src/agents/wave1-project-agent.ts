@@ -30,6 +30,7 @@ import { SemanticAnalysisAgent } from './semantic-analysis-agent.js';
 import { toCanonicalEntity, augmentWithCanonical } from './canonical-mapper.js';
 import { createLLMWithProcess } from './llm-with-process.js';
 import { PROCESS_TAGS } from './process-tags.js';
+import { parseLlmJson } from '../utils/parse-llm-json.js';
 
 // Phase 42.2 Plan 02 Gap 2 — process-tag for token-usage attribution.
 // Wave1 enrich + analyze + observation-retry all share this tag (forensics
@@ -291,11 +292,11 @@ IMPORTANT: Return ONLY the JSON object, no markdown code blocks.`;
           // Parse enriched observations
           let enrichedObs: string[] = [];
           try {
-            let cleaned = enrichResult.content.trim();
-            if (cleaned.startsWith('```')) {
-              cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+            const parsedResult = parseLlmJson<{ observations?: unknown }>(enrichResult.content);
+            if (parsedResult.repaired) {
+              log('[Wave1ProjectAgent] Repaired control characters in enrichment reply', 'debug');
             }
-            const parsed = JSON.parse(cleaned);
+            const parsed = parsedResult.value ?? {};
             enrichedObs = Array.isArray(parsed.observations)
               ? parsed.observations.filter((o: unknown): o is string => typeof o === 'string')
               : [];
@@ -498,13 +499,21 @@ IMPORTANT: Return ONLY the JSON object, no markdown code blocks or surrounding t
     component: ComponentManifestEntry,
   ): ComponentAnalysis {
     try {
-      // Strip potential markdown code fences
-      let cleaned = content.trim();
-      if (cleaned.startsWith('```')) {
-        cleaned = cleaned.replace(/^```(?:json)?\n?/, '').replace(/\n?```$/, '');
+      // A raw newline inside a string value used to end up here as a thrown
+      // parse error and a one-sentence fallback, which the downstream
+      // "single-sentence stubs" constraint then rejected — losing the whole
+      // component. parseLlmJson escapes the control characters and carries on.
+      const parsedResult = parseLlmJson<Record<string, unknown>>(content);
+      if (parsedResult.value === null) {
+        throw new Error(parsedResult.error || 'unparseable LLM reply');
       }
-
-      const parsed = JSON.parse(cleaned);
+      if (parsedResult.repaired) {
+        log(
+          `[Wave1ProjectAgent] Repaired control characters in LLM reply for ${component.name}`,
+          'info',
+        );
+      }
+      const parsed = parsedResult.value;
 
       return {
         summary: typeof parsed.summary === 'string' ? parsed.summary : component.description,
@@ -966,11 +975,11 @@ Return a JSON array of strings, e.g. ["observation 1", "observation 2"]`;
 
       let retryObs: string[] = [];
       try {
-        let cleaned = result.content.trim();
-        if (cleaned.startsWith('```')) {
-          cleaned = cleaned.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+        const parsedResult = parseLlmJson<unknown>(result.content);
+        if (parsedResult.repaired) {
+          log('[Wave1ProjectAgent] Repaired control characters in observation retry', 'debug');
         }
-        const parsed = JSON.parse(cleaned);
+        const parsed = parsedResult.value;
         retryObs = Array.isArray(parsed)
           ? parsed.filter((o: unknown): o is string => typeof o === 'string')
           : [];

@@ -22,6 +22,7 @@ import type { CgrObservationBuilder } from '../utils/cgr-observation-builder.js'
 import { toCanonicalEntity, augmentWithCanonical } from './canonical-mapper.js';
 import { createLLMWithProcess } from './llm-with-process.js';
 import { PROCESS_TAGS } from './process-tags.js';
+import { parseLlmJson } from '../utils/parse-llm-json.js';
 
 // Phase 42.2 Plan 02 Gap 2 — process-tag for token-usage attribution.
 // Wave3 discover + observation-retry share this tag (forensics §2.1 row 6-7).
@@ -425,13 +426,14 @@ Write as if this is the only documentation available about this detail.
    */
   private parseL3Response(responseText: string): L3DiscoveryResponse {
     try {
-      // Strip markdown code fences if present
-      let cleaned = responseText.trim();
-      if (cleaned.startsWith('```')) {
-        cleaned = cleaned.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+      const parsedResult = parseLlmJson<L3DiscoveryResponse>(responseText);
+      if (parsedResult.value === null) {
+        throw new Error(parsedResult.error || 'unparseable LLM reply');
       }
-
-      const parsed = JSON.parse(cleaned) as L3DiscoveryResponse;
+      if (parsedResult.repaired) {
+        log('[Wave3Agent] Repaired control characters in LLM reply', 'info');
+      }
+      const parsed = parsedResult.value;
 
       if (!parsed.details || !Array.isArray(parsed.details)) {
         log('[Wave3Agent] Invalid LLM response: missing details array', 'warning');
@@ -618,11 +620,11 @@ Return a JSON array of strings, e.g. ["observation 1", "observation 2"]`;
 
       let retryObs: string[] = [];
       try {
-        let cleaned = result.content.trim();
-        if (cleaned.startsWith('```')) {
-          cleaned = cleaned.replace(/^```(?:json)?\s*\n?/, '').replace(/\n?```\s*$/, '');
+        const parsedResult = parseLlmJson<unknown>(result.content);
+        if (parsedResult.repaired) {
+          log('[Wave3Agent] Repaired control characters in observation retry', 'debug');
         }
-        const parsed = JSON.parse(cleaned);
+        const parsed = parsedResult.value;
         retryObs = Array.isArray(parsed)
           ? parsed.filter((o: unknown): o is string => typeof o === 'string')
           : [];
