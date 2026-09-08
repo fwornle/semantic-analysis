@@ -391,6 +391,12 @@ interface ShimRelation {
   from: string;
   to: string;
   type: string;
+  /**
+   * Did the relationship sweep actually store this edge? `false` models the
+   * skip taken when an endpoint is missing from persistedEntityNames (a
+   * constraint-rejected parent). Defaults to stored.
+   */
+  stored?: boolean;
 }
 
 interface ShimAdapter {
@@ -407,7 +413,9 @@ interface ShimAdapter {
 
 function findBestParentShim(entityName: string, allEntities: ShimEntity[]): string | null {
   const candidates = allEntities.filter(
-    (e) => e.entityType === 'SubComponent' || e.entityType === 'Component',
+    (e) =>
+      (e.entityType === 'SubComponent' || e.entityType === 'Component') &&
+      e.name !== entityName, // never a candidate parent for itself
   );
   const lowerName = entityName.toLowerCase();
   let bestMatch: ShimEntity | null = null;
@@ -467,13 +475,18 @@ async function runAnchorPassShim(
     );
   }
 
-  // Two-layer idempotency check
-  const alreadyAnchored = new Set<string>();
-  for (const rel of relationships) {
-    if (rel.type === 'contains' || rel.type === 'parent-child') {
-      alreadyAnchored.add(rel.to);
-    }
-  }
+  // Two-layer idempotency check.
+  //
+  // Layer (a) mirrors the real sweep: only edges that were actually STORED
+  // count. `storedEdgeTargets` stands in for the relationship sweep's result.
+  // Marking every INTENDED target here is the bug this shim used to encode —
+  // an edge skipped because its parent failed the constraint gate left the
+  // target flagged as anchored, so the repair pass never ran for it.
+  const alreadyAnchored = new Set<string>(
+    relationships
+      .filter((r) => (r.type === 'contains' || r.type === 'parent-child') && r.stored !== false)
+      .map((r) => r.to),
+  );
   for (const e of entities) {
     if (alreadyAnchored.has(e.name)) continue;
     try {
@@ -551,13 +564,32 @@ describe('Phase 42.1 — project-anchor parity (anchor pass)', () => {
     const runId = 'wave-analysis-test-A';
     const result = await runAnchorPassShim(entities, relationships, adapter, runId, 'coding');
 
-    assert.equal(result.anchorEdgesAdded, 1, 'one anchor edge added');
+    // Every non-Project entity is anchored: the Detail to its deepest
+    // substring match, and BOTH the Component and the SubComponent to the
+    // Coding root. This asserted 1 until 2026-09-08, which encoded the
+    // findBestParent self-match defect — a Component/SubComponent resolved to
+    // itself, the self-edge guard refused it, and it was silently left
+    // unanchored. The substring-precedence contract this test exists for is
+    // unchanged and asserted explicitly below.
+    assert.equal(result.anchorEdgesAdded, 3, 'every non-Project entity anchored');
     assert.equal(result.anchorEdgesFailed, 0, 'no failures');
-    assert.equal(storeRelationship.mock.calls.length, 1, 'storeRelationship called once');
-    const args = storeRelationship.mock.calls[0].arguments;
+    assert.equal(storeRelationship.mock.calls.length, 3, 'storeRelationship called per anchored entity');
+    const detailCall = storeRelationship.mock.calls
+      .map((c) => c.arguments)
+      .find((a) => a[1] === 'TranscriptAdapterDetail');
+    assert.ok(detailCall, 'the Detail was anchored');
+    const args = detailCall!;
     assert.equal(args[0], 'TranscriptAdapter', 'parent is deepest SubComponent match (not TranscriptProcessor)');
     assert.equal(args[1], 'TranscriptAdapterDetail', 'child is target entity');
     assert.equal(args[2], 'contains', "relation type is 'contains'");
+    // The Component and SubComponent fall back to the root rather than to
+    // themselves.
+    const rootAnchored = storeRelationship.mock.calls
+      .map((c) => c.arguments)
+      .filter((a) => a[0] === 'Coding')
+      .map((a) => a[1])
+      .sort();
+    assert.deepEqual(rootAnchored, ['TranscriptAdapter', 'TranscriptProcessor']);
     const metadata = args[3] as Record<string, unknown>;
     assert.equal(metadata.source, 'wave-analysis', 'metadata.source stamped');
     assert.equal(metadata.runId, runId, 'metadata.runId stamped (T-42.1-03 provenance)');
@@ -671,19 +703,23 @@ describe('Phase 42.1 — project-anchor parity (anchor pass)', () => {
       'coding',
     );
 
-    // anchor pass walks: TranscriptAdapter (SubComponent → self-match → skipped),
+    // anchor pass walks: TranscriptAdapter (no other Component/SubComponent to
+    // match → falls back to Coding → added; it used to self-match and be
+    // skipped, which was the findBestParent defect),
     // TranscriptAdapterChildDetail (in alreadyAnchored Set → skipped),
     // UnrelatedDetail (no Component match → falls back to Coding → added).
-    assert.equal(result.anchorEdgesAdded, 1, 'one anchor edge added (UnrelatedDetail → Coding)');
-    assert.equal(storeRelationship.mock.calls.length, 1, 'anchor-pass storeRelationship called once');
+    // The contract under test — an already-anchored entity is NOT re-anchored
+    // — is unchanged and asserted below.
+    assert.equal(result.anchorEdgesAdded, 2, 'TranscriptAdapter and UnrelatedDetail anchored');
+    assert.equal(storeRelationship.mock.calls.length, 2, 'anchor-pass storeRelationship called twice');
     // The single anchor-pass call must NOT target TranscriptAdapterChildDetail:
     const targets = storeRelationship.mock.calls.map((c) => c.arguments[1]);
     assert.ok(
       !targets.includes('TranscriptAdapterChildDetail'),
       'TranscriptAdapterChildDetail NOT re-anchored (in-wave Set caught it)',
     );
-    // And it must be the UnrelatedDetail call:
-    assert.equal(targets[0], 'UnrelatedDetail', 'UnrelatedDetail correctly anchored to Coding');
+    // And both remaining entities must be the ones anchored to Coding:
+    assert.deepEqual([...targets].sort(), ['TranscriptAdapter', 'UnrelatedDetail']);
   });
 
   // -------------------------------------------------------------------------
@@ -787,6 +823,93 @@ describe('Phase 42.1 — project-anchor parity (anchor pass)', () => {
   });
 
   // -------------------------------------------------------------------------
+  // -------------------------------------------------------------------------
+  // Anchor pass repairs what the relationship sweep could not store.
+  //
+  // The 2026-09-07 failure: a parent that fails the constraint gate is not in
+  // persistedEntityNames, so its children's contains edges are SKIPPED by the
+  // relationship sweep. Layer (a) then marked those children anchored anyway
+  // — because it walked the intended relations — and the repair pass that
+  // exists for exactly this case reported added=0 and wrote nothing. The
+  // children were left with no incoming edge: orphans.
+  // -------------------------------------------------------------------------
+  it('synthesizes an edge for a child whose intended edge was NOT stored', async () => {
+    const entities: ShimEntity[] = [
+      { name: 'Coding', entityType: 'Project' },
+      { name: 'CostModelEngine', entityType: 'Component' },
+      { name: 'CostModelEngineBudget', entityType: 'SubComponent' },
+    ];
+    // The parent was constraint-rejected, so the sweep skipped this edge.
+    const relationships: ShimRelation[] = [
+      { from: 'CostModelEngine', to: 'CostModelEngineBudget', type: 'contains', stored: false },
+    ];
+    const calls: Array<{ from: string; to: string; type: string }> = [];
+    const adapter: ShimAdapter = {
+      queryEntities: async () => [{ name: 'Coding' }],
+      storeEntity: async () => ({ id: 'x' }),
+      storeRelationship: async (from, to, type) => {
+        calls.push({ from, to, type });
+      },
+      queryIncomingRelations: async () => [],
+    };
+
+    const result = await runAnchorPassShim(entities, relationships, adapter, 'run-anchor-1', 'coding');
+
+    assert.equal(result.anchorEdgesAdded, 2, 'both unanchored entities get an edge');
+    const repaired = calls.find((c) => c.to === 'CostModelEngineBudget');
+    assert.ok(repaired, 'the child whose edge was skipped must be repaired');
+    assert.equal(repaired?.type, 'contains');
+  });
+
+  it('does NOT re-add an edge that the sweep really stored', async () => {
+    const entities: ShimEntity[] = [
+      { name: 'Coding', entityType: 'Project' },
+      { name: 'LiveLoggingSystem', entityType: 'Component' },
+    ];
+    const relationships: ShimRelation[] = [
+      { from: 'Coding', to: 'LiveLoggingSystem', type: 'contains', stored: true },
+    ];
+    const calls: Array<{ from: string; to: string }> = [];
+    const adapter: ShimAdapter = {
+      queryEntities: async () => [{ name: 'Coding' }],
+      storeEntity: async () => ({ id: 'x' }),
+      storeRelationship: async (from, to) => {
+        calls.push({ from, to });
+      },
+      queryIncomingRelations: async () => [],
+    };
+
+    const result = await runAnchorPassShim(entities, relationships, adapter, 'run-anchor-2', 'coding');
+
+    assert.equal(result.anchorEdgesAdded, 0, 'nothing to repair');
+    assert.equal(result.anchorEdgesSkipped, 1);
+    assert.equal(calls.length, 0, 'a stored edge must not be duplicated');
+  });
+
+  it('a Component/SubComponent falls back to the Coding root rather than itself', async () => {
+    // findBestParent used to include the entity in its own candidate list.
+    // Every string contains itself and self is the longest self-match, so a
+    // Component always resolved to itself, the self-edge guard refused it,
+    // and the truthy bestMatch short-circuited the 'Coding' fallback — the
+    // anchor pass could not repair a Component or SubComponent at all.
+    const entities: ShimEntity[] = [
+      { name: 'Coding', entityType: 'Project' },
+      { name: 'MultiUserSessionRouter', entityType: 'SubComponent' },
+    ];
+    const calls: Array<{ from: string; to: string }> = [];
+    const adapter: ShimAdapter = {
+      queryEntities: async () => [{ name: 'Coding' }],
+      storeEntity: async () => ({ id: 'x' }),
+      storeRelationship: async (from, to) => { calls.push({ from, to }) },
+      queryIncomingRelations: async () => [],
+    };
+
+    const result = await runAnchorPassShim(entities, [], adapter, 'run-anchor-3', 'coding');
+
+    assert.equal(result.anchorEdgesAdded, 1);
+    assert.deepEqual(calls[0], { from: 'Coding', to: 'MultiUserSessionRouter' });
+  });
+
   // Test 12 — source-grep guard: real implementation contains the load-bearing
   // patterns. Protects against accidental deletion when the shim above is
   // refactored or when persistence-agent.ts is finally retired.
@@ -807,6 +930,34 @@ describe('Phase 42.1 — project-anchor parity (anchor pass)', () => {
     assert.match(src, /entityType === 'Project'/, "Project skip rule present");
     assert.match(src, /entityType === 'System'/, "System skip rule present");
     assert.match(src, /queryIncomingRelations/, 'two-layer idempotency calls queryIncomingRelations');
+
+    // Layer (a) must key on edges that were STORED, not merely intended.
+    // Walking `relationships` here is the 2026-09-07 bug: the pass reported
+    // added=0 skipped=N failed=0 for every batch while the entities it
+    // skipped had no incoming edge at all.
+    assert.match(src, /anchoredByStoredEdge/, 'anchor layer (a) keys on stored edges');
+    assert.match(
+      src,
+      /e\.name !== entityName,/,
+      'findBestParent excludes the entity from its own candidate list',
+    );
+    assert.match(
+      src,
+      /const alreadyAnchored = new Set<string>\(anchoredByStoredEdge\);/,
+      'alreadyAnchored seeded from stored edges only',
+    );
+    assert.doesNotMatch(
+      src,
+      /for \(const rel of relationships\) \{\s*if \(rel\.type === 'contains'[\s\S]{0,120}alreadyAnchored\.add/,
+      'the intent-based anchoring loop must not come back',
+    );
+    // The project anchor must exist before the relationship sweep drops
+    // edges whose endpoints it cannot resolve.
+    assert.match(
+      src,
+      /await this\.ensureProjectAnchor\(runId\);\s*\n\s*\/\/ ---- Relationship sweep ----/,
+      'ensureProjectAnchor runs before the relationship sweep',
+    );
 
     // Provenance metadata stamped on every storeRelationship call (T-42.1-03)
     assert.match(src, /source:\s*'wave-analysis'/, "metadata.source: 'wave-analysis' stamped on anchor edges");

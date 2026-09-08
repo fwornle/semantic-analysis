@@ -2284,7 +2284,17 @@ export class WaveController {
    */
   private findBestParent(entityName: string, allEntities: SharedMemoryEntity[]): string | null {
     const candidates = allEntities.filter(
-      (e) => e.entityType === 'SubComponent' || e.entityType === 'Component',
+      (e) =>
+        (e.entityType === 'SubComponent' || e.entityType === 'Component') &&
+        // NEVER consider the entity itself. Every string contains itself, and
+        // self is by definition the longest self-match, so without this an
+        // entity that IS a Component/SubComponent always resolved to itself:
+        // the caller then refused the self-edge and counted a skip, and the
+        // truthy `bestMatch` short-circuited the 'Coding' fallback below. Net
+        // effect — the anchor pass could not repair a Component or
+        // SubComponent at all, only a Detail. That is why 4 SubComponents were
+        // still orphaned after the 2026-09-08 run.
+        e.name !== entityName,
     );
 
     const lowerName = entityName.toLowerCase();
@@ -2338,7 +2348,12 @@ export class WaveController {
     try {
       const existing = await this.kmCoreAdapter.queryEntities({ entityType: 'Project' });
       if (existing.some((e) => e.name === 'Coding')) {
-        // Already present — idempotent re-run.
+        // Already present — idempotent re-run. Still seed the name: the
+        // relationship sweep drops edges whose endpoints it cannot find in
+        // persistedEntityNames, and returning without seeding made every
+        // `Coding -> Component` edge depend on the init-time seed having
+        // loaded the Project.
+        this.persistedEntityNames.add('Coding');
         return;
       }
       await this.kmCoreAdapter.storeEntity(
@@ -2462,10 +2477,31 @@ export class WaveController {
       }
     }
 
+    // The Coding Project anchor must exist BEFORE the relationship sweep, not
+    // after it: the sweep drops any edge whose endpoints are not in
+    // persistedEntityNames, so on a cold start every `Coding -> Component`
+    // contains edge was skipped and then the anchor pass — which used to mint
+    // the anchor — reported them as already handled.
+    await this.ensureProjectAnchor(runId);
+
     // ---- Relationship sweep ----
+    // Targets whose contains/parent-child edge ACTUALLY landed. The anchor
+    // pass keys off this rather than off `relationships`, because an intended
+    // edge is not an edge: a relation whose parent failed the constraint gate
+    // is skipped here, and marking its target "anchored" is what disarmed the
+    // repair pass that exists precisely for this case.
+    const anchoredByStoredEdge = new Set<string>();
     for (const rel of relationships) {
       if (!this.persistedEntityNames.has(rel.from) || !this.persistedEntityNames.has(rel.to)) {
         relationshipsSkipped += 1;
+        if (rel.type === 'contains' || rel.type === 'parent-child') {
+          // Leave a trace: this is the edge the anchor pass will have to
+          // synthesize, and its absence used to be silent.
+          log(
+            `[WaveController] relation skipped, endpoint not persisted: ${rel.from} -> ${rel.to} (${rel.type})`,
+            'debug',
+          );
+        }
         continue;
       }
       try {
@@ -2476,6 +2512,9 @@ export class WaveController {
           { weight: rel.weight, source: rel.source, batchId: rel.batchId, runId },
         );
         relationshipsStored += 1;
+        if (rel.type === 'contains' || rel.type === 'parent-child') {
+          anchoredByStoredEdge.add(rel.to);
+        }
       } catch (err) {
         relationshipErrors += 1;
         process.stderr.write(
@@ -2500,16 +2539,15 @@ export class WaveController {
     //   (b) km-core store query for existing incoming edges (second-run case)
     // Layer (c) — km-core's addRelation is upsert-by-(from,to,type) — gives a
     // third defense at the storage layer.
-    await this.ensureProjectAnchor(runId);
+    // ensureProjectAnchor now runs before the relationship sweep (see above).
 
-    const alreadyAnchored = new Set<string>();
-
-    // Layer (a) — in-wave relations just stored above.
-    for (const rel of relationships) {
-      if (rel.type === 'contains' || rel.type === 'parent-child') {
-        alreadyAnchored.add(rel.to);
-      }
-    }
+    // Layer (a) — in-wave edges that were actually STORED. This used to walk
+    // `relationships` and mark every intended target, so an entity whose edge
+    // had just been skipped was treated as anchored and never repaired: the
+    // pass reported `added=0 skipped=N failed=0` for every batch of the
+    // 2026-09-07 runs while the entities it skipped had no incoming edge at
+    // all.
+    const alreadyAnchored = new Set<string>(anchoredByStoredEdge);
 
     // Layer (b) — persisted store. Use the adapter's queryIncomingRelations
     // (Phase 42.1 added). On adapter failure, fall through to the storeRelationship
