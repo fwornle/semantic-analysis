@@ -242,7 +242,10 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
    * is a hot path. For Plan 1 the wave-controller bypass loop runs
    * <1000x per `ukb full` (one merge per entity), so O(n) per call is OK.
    */
-  async function findEntityByName(name: string): Promise<Entity | undefined> {
+  async function findEntityByName(
+    name: string,
+    entityType?: string,
+  ): Promise<Entity | undefined> {
     // Phase 42.2 Plan 06 bugfix — pass {includeSuperseded: true} so we see
     // the Phase 42-05 migrated cohort whose `validUntil: null` would
     // otherwise cause km-core's default isActive filter to drop them
@@ -253,10 +256,47 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
     // Component/SubComponent gets orphaned. Caught silently by the anchor
     // pass try/catch → SC#6 fails with 18+ orphans. See augment-team-field-
     // 42.2.mjs:163 for the same pattern.
+    //
+    // OLDEST WINS, and it must: this used to return the first name match in
+    // iteration order, which was unspecified. With duplicate nodes in the
+    // graph that made edge endpoints non-deterministic — storeRelationship
+    // could attach an edge to one duplicate while storeEntity had just
+    // written another. The oldest node is the one carrying the accumulated
+    // edges, so binding to it keeps writes and edges on the same node.
+    // `entityType`, when supplied, is preferred but not required: a name
+    // shared by two different types must not bind a Component's write onto
+    // an Insight that happens to share its name.
+    let best: Entity | undefined;
+    let bestTypeMatch = false;
     for await (const e of store.iterate(undefined, { includeSuperseded: true })) {
-      if (e.name === name) return e;
+      if (e.name !== name) continue;
+      const typeMatch = entityType === undefined || e.entityType === entityType;
+      if (best === undefined) {
+        best = e;
+        bestTypeMatch = typeMatch;
+        continue;
+      }
+      // A type match always beats a non-match; among equals, oldest wins.
+      if (typeMatch && !bestTypeMatch) {
+        best = e;
+        bestTypeMatch = true;
+      } else if (typeMatch === bestTypeMatch && isOlder(e, best)) {
+        best = e;
+      }
     }
-    return undefined;
+    if (entityType !== undefined && best !== undefined && !bestTypeMatch) {
+      // Only a different-typed node shares this name — not our entity.
+      return undefined;
+    }
+    return best;
+  }
+
+  /** Creation order, falling back to the time-ordered id when createdAt is absent. */
+  function isOlder(a: Entity, b: Entity): boolean {
+    const at = a.createdAt ?? '';
+    const bt = b.createdAt ?? '';
+    if (at !== bt) return at < bt;
+    return String(a.id) < String(b.id);
   }
 
   /** Resolve `${team}:${name}` → Entity by stripping the team prefix. */
@@ -464,9 +504,33 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
     // upstream bugs (per Plan 57-03 Task 2 action).
     const projectFromOptions = isProject(options.project) ? options.project : undefined;
 
-    // Build the putEntity payload (id is minted by the store; createdAt /
-    // updatedAt are stamped by the store on the strict path per D-31/D-32).
+    // UPSERT, not insert. putEntity mints a fresh EntityId whenever `id` is
+    // absent (GraphKMStore.putEntity: `else { id = mintEntityId(); }`), and
+    // this function never supplied one — so every re-run minted a SECOND node
+    // for a component that already existed. Meanwhile storeRelationship
+    // resolves its endpoints by NAME, so the contains edges kept landing on
+    // the pre-existing node and each run's freshly minted nodes were born
+    // edgeless. That is where the orphans came from: on 2026-09-07,
+    // `LiveLoggingSystem` existed as four nodes, one with 13265 incoming
+    // edges and two with none, and 155 of 163 orphans shared a name with
+    // another node.
+    //
+    // Passing the existing id makes this a CONFIRM-WRITE: km-core keeps
+    // `createdBy`, bumps `confirmationCount`, and Graphology's mergeNode
+    // updates the attributes we pass while preserving the node's edges. The
+    // supersession branch cannot fire here — it is guarded by `!existing` AND
+    // we never set `supersedes`.
+    const existingEntity = await findEntityByName(name, entityType);
+
+    // Build the putEntity payload. On the insert path the store mints the id
+    // and stamps createdAt/updatedAt (D-31/D-32); on the upsert path we carry
+    // the original createdAt forward, because putEntity stamps
+    // `createdAt: e.createdAt ?? now` and mergeNode would otherwise overwrite
+    // the real creation date with the time of the latest run.
     const entity: Partial<Entity> & { name: string; entityType: string } = {
+      ...(existingEntity
+        ? { id: existingEntity.id, createdAt: existingEntity.createdAt }
+        : {}),
       name,
       entityType,
       ontologyClass,

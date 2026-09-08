@@ -38,17 +38,19 @@ interface StubEntity {
 class StubGraphKMStore {
   // Calls captured for assertions:
   public mergeAttributesCalls: Array<{ id: string; attrs: Record<string, unknown> }> = [];
+  /** What the ADAPTER passed — `id` absent here means "mint me a new node". */
+  public putEntityArgs: Array<Partial<StubEntity>> = [];
+  /** What ended up stored, after the store stamped a minted id. */
   public putEntityCalls: StubEntity[] = [];
   public addRelationCalls: Array<{ type: string; from: string; to: string; metadata?: unknown }> = [];
   public batchCalls: unknown[] = [];
 
-  // In-memory store keyed by entity name
-  private byName = new Map<string, StubEntity>();
-  // In-memory store keyed by id
+  // In-memory store keyed by id — NOT by name. The real graph is keyed by
+  // EntityId and can hold several nodes sharing a name; a name-keyed stub
+  // cannot represent the duplicate-node bug at all.
   private byId = new Map<string, StubEntity>();
 
   seed(entity: StubEntity): void {
-    this.byName.set(entity.name, entity);
     this.byId.set(entity.id, entity);
   }
 
@@ -63,10 +65,10 @@ class StubGraphKMStore {
 
   async putEntity(entity: StubEntity, _opts?: unknown): Promise<string> {
     // km-core's putEntity returns EntityId; stamp one if the caller omitted.
+    this.putEntityArgs.push({ ...entity });
     const id = entity.id ?? `01902b78-3c4a-7000-9000-${String(this.putEntityCalls.length).padStart(12, '0')}`;
     const stored = { ...entity, id };
     this.putEntityCalls.push(stored);
-    this.byName.set(stored.name, stored);
     this.byId.set(stored.id, stored);
     return id;
   }
@@ -77,13 +79,13 @@ class StubGraphKMStore {
 
   async findByOntologyClass(klass: string): Promise<StubEntity[]> {
     const out: StubEntity[] = [];
-    for (const e of this.byName.values()) if (e.ontologyClass === klass) out.push(e);
+    for (const e of this.byId.values()) if (e.ontologyClass === klass) out.push(e);
     return out;
   }
 
   // eslint-disable-next-line @typescript-eslint/require-await
   async *iterate(): AsyncIterable<StubEntity> {
-    for (const e of this.byName.values()) yield e;
+    for (const e of this.byId.values()) yield e;
   }
 
   async addRelation(r: { type: string; from: string; to: string; metadata?: unknown }): Promise<void> {
@@ -313,5 +315,130 @@ describe('wave-controller bypass — phase 10 fix', () => {
     assert.deepEqual(call.attrs.embedding, embedding);
     assert.equal(call.attrs.role, 'core');
     assert.equal(call.attrs.enrichedContext, 'temporal-context-blob');
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Section 6: storeEntity upserts instead of minting duplicates
+//
+// The orphan bug (2026-09-07): putEntity mints a fresh EntityId whenever `id`
+// is absent, and storeEntity never supplied one — so every run created a
+// SECOND node for an existing component, while storeRelationship resolved its
+// endpoints by name and kept attaching edges to the FIRST one. The new nodes
+// were born edgeless. `LiveLoggingSystem` ended up as four nodes, one with
+// 13265 incoming edges and two with none.
+// ---------------------------------------------------------------------------
+
+/** Same name, distinct id and creation time — what a second run used to produce. */
+function dupEntity(name: string, klass: string, id: string, createdAt: string): StubEntity {
+  return {
+    ...freshEntity(name, klass),
+    id,
+    createdAt,
+    updatedAt: createdAt,
+  };
+}
+
+describe('km-core-adapter — storeEntity upsert', () => {
+  it('re-writes the EXISTING node instead of minting a second one', async () => {
+    const store = new StubGraphKMStore();
+    store.seed(freshEntity('LiveLoggingSystem', 'Component'));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    await adapter.storeEntity(
+      { name: 'LiveLoggingSystem', entityType: 'Component', observations: ['re-analysed'] },
+      { team: 'coding' },
+    );
+
+    assert.equal(store.putEntityCalls.length, 1);
+    assert.equal(
+      store.putEntityArgs[0].id,
+      freshEntity('LiveLoggingSystem', 'Component').id,
+      'must reuse the existing EntityId — a minted one is a duplicate node',
+    );
+  });
+
+  it('carries createdAt forward so the confirm-write keeps the real creation date', async () => {
+    const store = new StubGraphKMStore();
+    const original = freshEntity('KnowledgeManagement', 'Component');
+    store.seed(original);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    await adapter.storeEntity(
+      { name: 'KnowledgeManagement', entityType: 'Component', observations: ['x'] },
+      { team: 'coding' },
+    );
+
+    // putEntity stamps `createdAt: e.createdAt ?? now`, and mergeNode would
+    // overwrite the stored date with the time of this run.
+    assert.equal(store.putEntityArgs[0].createdAt, original.createdAt);
+  });
+
+  it('still mints for a name the graph has never seen', async () => {
+    const store = new StubGraphKMStore();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    await adapter.storeEntity(
+      { name: 'BrandNewThing', entityType: 'SubComponent', observations: ['x'] },
+      { team: 'coding' },
+    );
+
+    assert.equal(store.putEntityCalls.length, 1);
+    assert.equal(store.putEntityArgs[0].id, undefined, 'no id ⇒ the store mints one');
+  });
+
+  it('does not bind onto a different-typed entity that happens to share the name', async () => {
+    const store = new StubGraphKMStore();
+    store.seed(freshEntity('Pipeline', 'Insight'));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    await adapter.storeEntity(
+      { name: 'Pipeline', entityType: 'Component', observations: ['x'] },
+      { team: 'coding' },
+    );
+
+    assert.equal(store.putEntityArgs[0].id, undefined, 'an Insight is not this Component');
+  });
+});
+
+describe('km-core-adapter — name resolution is deterministic', () => {
+  it('binds to the OLDEST duplicate, which is where the edges already are', async () => {
+    const store = new StubGraphKMStore();
+    // Deliberately seeded newest-first so "first match in iteration order"
+    // would pick the wrong one.
+    store.seed(dupEntity('Ontology', 'Component', 'id-new', '2026-09-07T17:40:00.000Z'));
+    store.seed(dupEntity('Ontology', 'Component', 'id-old', '2026-03-07T12:38:00.000Z'));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    const found = await adapter.getEntity('Ontology', 'coding');
+    assert.equal(found?.id, 'id-old');
+  });
+
+  it('puts an edge on the same node storeEntity writes to', async () => {
+    // The two used to disagree: storeEntity minted a new node, storeRelationship
+    // resolved by name to the old one, and the new node stayed edgeless.
+    const store = new StubGraphKMStore();
+    store.seed(dupEntity('Coding', 'Project', 'proj-old', '2026-03-07T12:38:00.000Z'));
+    store.seed(dupEntity('Insights', 'Component', 'comp-new', '2026-09-07T17:40:00.000Z'));
+    store.seed(dupEntity('Insights', 'Component', 'comp-old', '2026-05-01T00:00:00.000Z'));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    await adapter.storeEntity(
+      { name: 'Insights', entityType: 'Component', observations: ['x'] },
+      { team: 'coding' },
+    );
+    await adapter.storeRelationship('Coding', 'Insights', 'contains', {});
+
+    const written = store.putEntityCalls[0].id;
+    const edge = store.addRelationCalls[0];
+    assert.equal(written, 'comp-old');
+    assert.equal(edge.to, written, 'the edge must land on the node just written');
+    assert.equal(edge.from, 'proj-old');
   });
 });
