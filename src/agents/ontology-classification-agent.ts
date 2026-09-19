@@ -291,7 +291,7 @@ export class OntologyClassificationAgent {
         enabled: true,
         upperOntologyPath: path.join(
           this.basePath,
-          '.data/ontologies/upper/development-knowledge-ontology.json'
+          '.data/ontologies/development-knowledge-ontology.json'
         ),
         lowerOntologyPath: path.join(
           this.basePath,

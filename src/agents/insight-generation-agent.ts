@@ -356,7 +356,7 @@ export class InsightGenerationAgent {
   private loadOntologyDescriptions(): void {
     try {
       // Load upper ontology
-      const upperPath = path.join(this.repositoryPath, '.data/ontologies/upper/development-knowledge-ontology.json');
+      const upperPath = path.join(this.repositoryPath, '.data/ontologies/development-knowledge-ontology.json');
       if (fs.existsSync(upperPath)) {
         const upperOntology = JSON.parse(fs.readFileSync(upperPath, 'utf-8'));
         if (upperOntology.entities) {
