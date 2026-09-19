@@ -2,7 +2,7 @@
  * Unit tests for the deterministic L2 subsystem classifier — Phase 60 Plan 09.
  *
  * Locks the <behavior> block of 60-09-PLAN.md Task 1:
- *   - each of the 10 closed-vocabulary L2 classes is returned for at least one
+ *   - each of the 22 closed-vocabulary L2 classes is returned for at least one
  *     representative REAL entity name (reachability coverage test), using the L2
  *     class's declared parent;
  *   - parent-consistency: an OnlineObservation-keyword name whose L1 is Component
@@ -106,7 +106,7 @@ describe('classifyL2 — no-forced-L2 (generic names return null)', () => {
   });
 });
 
-describe('classifyL2 — 10-class reachability coverage', () => {
+describe('classifyL2 — 22-class reachability coverage', () => {
   // Each L2 class -> a representative real export name + its declared parent.
   const REPRESENTATIVES: Record<string, { name: string; parent: string }> = {
     LiveLoggingSystem: { name: 'LiveLoggingSystem', parent: 'Component' },
@@ -119,11 +119,27 @@ describe('classifyL2 — 10-class reachability coverage', () => {
     OnlineDigest: { name: 'ObservationConsolidator — Two-Tier Memory Aggregation', parent: 'Detail' },
     OnlineInsight: { name: 'InsightGenerationPipeline', parent: 'Detail' },
     EtmDaemon: { name: 'Enhanced Transcript Monitor (ETM)', parent: 'SubComponent' },
+    // Phase 61 corpus extension — 385 of 678 live coding insights matched none
+    // of the original 10 classes. Each representative below exercises that
+    // class's own keywords AND proves no earlier class in iteration order
+    // shadows it (first match within the parent group wins).
+    BenchmarkHarness: { name: 'kgbench Benchmarking Harness', parent: 'Component' },
+    AgentIntegration: { name: 'Copilot CLI Integration', parent: 'Component' },
+    ExperimentFramework: { name: 'A/B Experiment Runner', parent: 'Component' },
+    GsdWorkflow: { name: 'GSD Milestone State', parent: 'Component' },
+    HealthDashboard: { name: 'System Health Dashboard', parent: 'Component' },
+    StatusLine: { name: 'Tmux Statusline Click Handler', parent: 'Component' },
+    CodeGraph: { name: 'Graphify Incremental Rebuild', parent: 'Component' },
+    TokenAccounting: { name: 'Token Usage Accounting', parent: 'Component' },
+    OntologyAndViewer: { name: 'Ontology Path Resolver', parent: 'Component' },
+    ContinuousIntegration: { name: 'GitHub Actions CI Workflow', parent: 'Component' },
+    DocumentationSystem: { name: 'MkDocs Documentation Structure', parent: 'Component' },
+    InstallAndBootstrap: { name: 'install.sh Dependency Gate', parent: 'Component' },
   };
 
-  it('returns every one of the 10 L2 classes for at least one representative entity', () => {
+  it('returns every one of the 22 L2 classes for at least one representative entity', () => {
     const classes = Object.keys(L2_KEYWORD_MAP);
-    assert.equal(classes.length, 10, 'closed vocabulary must have exactly 10 L2 classes');
+    assert.equal(classes.length, 22, 'closed vocabulary must have exactly 22 L2 classes');
     for (const className of classes) {
       const rep = REPRESENTATIVES[className];
       assert.ok(rep, `missing representative for ${className}`);

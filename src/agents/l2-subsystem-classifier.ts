@@ -70,6 +70,60 @@ export const L2_KEYWORD_MAP: Record<string, L2Entry> = {
     parent: 'Component',
     keywords: ['dockerizedservices', 'docker-compose', 'coding-services', 'dockerized'],
   },
+  // --- Component-parented, Phase 61 corpus extension (12) ---
+  // Added from a measurement of the live coding corpus: 385 of 678 insights
+  // matched NONE of the original 10 classes, because that vocabulary predates
+  // the benchmark harness, experiment runner, GSD workflow, dashboard,
+  // status line, graphify, token accounting and CI work. Keep keywords tight
+  // and specific — a broad term here silently re-routes a whole subsystem.
+  BenchmarkHarness: {
+    parent: 'Component',
+    keywords: ['kgbench', 'benchmark', 'graphify-vs-grep', 'coding-v1'],
+  },
+  AgentIntegration: {
+    parent: 'Component',
+    keywords: ['copilot', 'opencode', 'claude code', 'agent launcher', 'headless agent', 'pi agent', 'model catalogue'],
+  },
+  ExperimentFramework: {
+    parent: 'Component',
+    keywords: ['experiment runner', 'a/b experiment', 'kb injection', 'avenue', 'experiment harness'],
+  },
+  GsdWorkflow: {
+    parent: 'Component',
+    keywords: ['gsd', '.planning', 'plan-phase', 'execute-phase', 'milestone state'],
+  },
+  HealthDashboard: {
+    parent: 'Component',
+    keywords: ['dashboard', 'system-health-dashboard', 'health api', 'coverage tab'],
+  },
+  StatusLine: {
+    parent: 'Component',
+    keywords: ['statusline', 'status line', 'tmux'],
+  },
+  CodeGraph: {
+    parent: 'Component',
+    keywords: ['graphify', 'codegraph', 'code graph', 'code-graph'],
+  },
+  TokenAccounting: {
+    parent: 'Component',
+    keywords: ['token usage', 'token accounting', 'token_usage', 'cost model', 'cache_read', 'billing'],
+  },
+  OntologyAndViewer: {
+    parent: 'Component',
+    keywords: ['ontology', 'unified viewer', 'vkb', 'entity level'],
+  },
+  ContinuousIntegration: {
+    parent: 'Component',
+    keywords: ['github action', 'ci workflow', 'ci pipeline', 'ci run', 'cross-platform ci'],
+  },
+  DocumentationSystem: {
+    parent: 'Component',
+    keywords: ['mkdocs', 'plantuml', 'documentation', 'diagram style', 'mermaid'],
+  },
+  InstallAndBootstrap: {
+    parent: 'Component',
+    keywords: ['install.sh', 'installer', 'bootstrap', 'first-run', 'feature resolver'],
+  },
   // --- Detail-parented (3) ---
   OnlineObservation: {
     parent: 'Detail',

@@ -2887,7 +2887,7 @@ async function getOntologyConfigManager(): Promise<OntologyConfigManager> {
     const basePath = process.env.KNOWLEDGE_BASE_PATH || process.cwd();
     const defaultConfig: ExtendedOntologyConfig = {
       enabled: true,
-      upperOntologyPath: path.join(basePath, '.data/ontologies/upper/development-knowledge-ontology.json'),
+      upperOntologyPath: path.join(basePath, '.data/ontologies/development-knowledge-ontology.json'),
       lowerOntologyPath: path.join(basePath, '.data/ontologies/lower/coding-ontology.json'),
       team: 'coding',
       validation: {
