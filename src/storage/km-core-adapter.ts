@@ -112,12 +112,22 @@ export interface KmCoreAdapter {
   /**
    * Add a relation by entity-name (B's convention). Resolves both names to
    * EntityIds via `store.findByName` then calls `store.addRelation`.
+   *
+   * `endpointTypes` disambiguates a DUPLICATED name. Name resolution is
+   * "oldest wins" (see findEntityByName), which is right when the duplicates
+   * are the same thing written twice and wrong when they are not: on
+   * 2026-09-20 a new `Detail` named EntityPatternAnalyzer shared its name with
+   * a Sep-7 `SubComponent` carrying 24 edges, so an anchor edge aimed at the
+   * Detail would have landed on the SubComponent instead. Supplying the
+   * expected entityType binds the edge to the intended node. Optional, so
+   * every existing caller keeps its current behaviour.
    */
   storeRelationship(
     fromName: string,
     toName: string,
     type: string,
     metadata?: Record<string, unknown>,
+    endpointTypes?: { from?: string; to?: string },
   ): Promise<void>;
 
   /**
@@ -139,7 +149,7 @@ export interface KmCoreAdapter {
    * already carry an incoming contains/parent-child edge from a previous
    * wave-analysis run (Layer (b) of the two-layer idempotency check).
    */
-  queryIncomingRelations(toName: string): Promise<Relation[]>;
+  queryIncomingRelations(toName: string, entityType?: string): Promise<Relation[]>;
 
   /**
    * Delete one entity by name. If the entity is not found, returns silently
@@ -522,6 +532,16 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
     // we never set `supersedes`.
     const existingEntity = await findEntityByName(name, entityType);
 
+    // One source for the level, so the `hierarchyLevel` stamp and the
+    // `isScaffoldNode` derivation below can never disagree. sourceMetadata
+    // wins over the loose `level` field, mirroring the stamps themselves.
+    const effectiveLevel =
+      typeof (sourceMetadata as { hierarchyLevel?: unknown }).hierarchyLevel === 'number'
+        ? (sourceMetadata as { hierarchyLevel: number }).hierarchyLevel
+        : typeof source.level === 'number'
+        ? source.level
+        : undefined;
+
     // Build the putEntity payload. On the insert path the store mints the id
     // and stamps createdAt/updatedAt (D-31/D-32); on the upsert path we carry
     // the original createdAt forward, because putEntity stamps
@@ -537,6 +557,28 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
       layer: 'evidence',
       description,
       metadata: {
+        // putEntity ends in `graph.mergeNode` (GraphKMStore.ts:508), a SHALLOW
+        // merge: handing it a `metadata` object REPLACES the stored one rather
+        // than merging into it. This function built metadata from
+        // `sourceMetadata` alone, so a caller that passes a partial metadata
+        // object silently erased everything a previous write had stamped.
+        //
+        // That is not hypothetical. Wave 4's insight stamp
+        // (wave-controller.ts:2988) passes only
+        // `{validated_file_path, has_insight_document}`, and on 2026-09-20 the
+        // live store held 181 insight-bearing Component/SubComponent/Detail
+        // rows and NOT ONE of them still had the `parentEntityName`,
+        // `ontology`, `source` or `project` that waves 1-3 wrote: 0 with both
+        // stamps, 181 with the insight stamp and no parent, 487 with a parent
+        // and no insight stamp. Waves 1-3 wrote them; wave 4 erased them.
+        //
+        // Seeding from the existing entity makes this a read-modify-write,
+        // matching the id/createdAt carry-forward in the spread above. NOTE the
+        // consequence: storeEntity is now ADDITIVE for metadata — a key can no
+        // longer be removed through it. No current caller removes keys
+        // (renameEntity already re-spreads oldMetadata), and a stale
+        // validated_file_path is rewritten by wave 4 on every run.
+        ...((existingEntity?.metadata as Record<string, unknown> | undefined) ?? {}),
         ...sourceMetadata,
         subsystem: 'wave-analysis',
         // Gap 4: prefer team from sourceMetadata when present (the
@@ -562,6 +604,32 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
           ? { project: projectFromOptions }
           : {}),
         ...(typeof source.significance !== 'undefined' ? { significance: source.significance } : {}),
+        // Hierarchy dual-stamp. persistWithKmCore passes `parentId` / `level`
+        // (wave-controller.ts:2461-2462) and this function dropped both, so
+        // `parentEntityName` / `hierarchyLevel` / `isScaffoldNode` never
+        // reached km-core on the current write path — the ~496 rows that still
+        // carry them are residue from the retired persistence agent. The
+        // PRIMARY stamp is canonical-mapper.ts:193-197; this mirrors it at the
+        // putEntity call site exactly as the team (Gap 4) and project (D-04)
+        // dual-stamps above do, sourceMetadata winning over the loose field.
+        ...(typeof (sourceMetadata as { parentEntityName?: unknown }).parentEntityName === 'string' &&
+        ((sourceMetadata as { parentEntityName?: string }).parentEntityName?.length ?? 0) > 0
+          ? { parentEntityName: (sourceMetadata as { parentEntityName: string }).parentEntityName }
+          : typeof source.parentId === 'string' && (source.parentId as string).length > 0
+          ? { parentEntityName: source.parentId }
+          : {}),
+        ...(effectiveLevel !== undefined ? { hierarchyLevel: effectiveLevel } : {}),
+        // Gated on a KNOWN level, never derived from a default. Writing this
+        // as `(source.level ?? 3) < 3` would evaluate to `false` for every
+        // caller that supplies no level at all (tools.ts handleCreateUkbEntity,
+        // renameEntity) and invent a fabricated fact for them. The `?? 3`
+        // default belongs to mapEntityToSharedMemory, which always holds a
+        // KGEntity; here the question is whether a level is known at all.
+        ...(typeof (sourceMetadata as { isScaffoldNode?: unknown }).isScaffoldNode === 'boolean'
+          ? { isScaffoldNode: (sourceMetadata as { isScaffoldNode: boolean }).isScaffoldNode }
+          : effectiveLevel !== undefined
+          ? { isScaffoldNode: effectiveLevel < 3 } // L0/L1/L2 scaffold — wave-controller.ts:2841
+          : {}),
         ...(typeof source.source !== 'undefined' ? { source: source.source } : {}),
         // Operator-enriched fields ride along on metadata until Plan 5
         // teaches consumers to read them from top-level Entity:
@@ -592,10 +660,13 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
     toName: string,
     type: string,
     metadata: Record<string, unknown> = {},
+    endpointTypes?: { from?: string; to?: string },
   ): Promise<void> {
+    // Pass the expected types through so a duplicated name resolves to the
+    // node the CALLER meant rather than to the oldest node wearing that name.
     const [from, to] = await Promise.all([
-      findEntityByName(fromName),
-      findEntityByName(toName),
+      findEntityByName(fromName, endpointTypes?.from),
+      findEntityByName(toName, endpointTypes?.to),
     ]);
     if (!from) {
       throw new Error(`km-core-adapter.storeRelationship: from-entity '${fromName}' not found`);
@@ -807,8 +878,14 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
   // queryIncomingRelations — Phase 42.1 INT-02
   // -------------------------------------------------------------------------
 
-  async function queryIncomingRelations(toName: string): Promise<Relation[]> {
-    const target = await findEntityByName(toName);
+  async function queryIncomingRelations(
+    toName: string,
+    entityType?: string,
+  ): Promise<Relation[]> {
+    // Without `entityType` this asks about the OLDEST node bearing the name,
+    // which is how a brand-new entity inherited an older namesake's edges and
+    // was reported as already anchored — leaving it in the graph with none.
+    const target = await findEntityByName(toName, entityType);
     if (!target) {
       // Tolerant no-op — caller treats empty result as "no anchor known".
       return [];

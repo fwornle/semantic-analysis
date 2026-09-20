@@ -442,3 +442,130 @@ describe('km-core-adapter — name resolution is deterministic', () => {
     assert.equal(edge.from, 'proj-old');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Section 6: hierarchy metadata + the shallow-merge clobber
+// ---------------------------------------------------------------------------
+
+/** freshEntity with a caller-chosen metadata object. */
+function withMetadata(
+  name: string,
+  klass: string,
+  metadata: Record<string, unknown>,
+): StubEntity {
+  return { ...freshEntity(name, klass), metadata };
+}
+
+describe('km-core-adapter — hierarchy metadata', () => {
+  const mk = (store: StubGraphKMStore) =>
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+  it('stamps parentEntityName from source.parentId', async () => {
+    const store = new StubGraphKMStore();
+    await mk(store).storeEntity(
+      { name: 'RedactionEngine', entityType: 'SubComponent', parentId: 'LiveLoggingSystem' },
+      { team: 'coding' },
+    );
+    const md = store.putEntityArgs[0].metadata as Record<string, unknown>;
+    assert.equal(md.parentEntityName, 'LiveLoggingSystem');
+  });
+
+  it('stamps hierarchyLevel from source.level', async () => {
+    const store = new StubGraphKMStore();
+    await mk(store).storeEntity(
+      { name: 'RedactionEngine', entityType: 'SubComponent', level: 2 },
+      { team: 'coding' },
+    );
+    const md = store.putEntityArgs[0].metadata as Record<string, unknown>;
+    assert.equal(md.hierarchyLevel, 2);
+  });
+
+  it('derives isScaffoldNode from the level — true at L2, false at L3', async () => {
+    const l2 = new StubGraphKMStore();
+    await mk(l2).storeEntity({ name: 'A', entityType: 'SubComponent', level: 2 }, { team: 'coding' });
+    assert.equal((l2.putEntityArgs[0].metadata as Record<string, unknown>).isScaffoldNode, true);
+
+    const l3 = new StubGraphKMStore();
+    await mk(l3).storeEntity({ name: 'B', entityType: 'Detail', level: 3 }, { team: 'coding' });
+    assert.equal((l3.putEntityArgs[0].metadata as Record<string, unknown>).isScaffoldNode, false);
+  });
+
+  it('omits isScaffoldNode entirely when no level is supplied', async () => {
+    // Guards the non-wave callers (tools.ts handleCreateUkbEntity, renameEntity).
+    // Writing the derivation as `(source.level ?? 3) < 3` would evaluate to
+    // `false` here and invent a fabricated fact for every one of them.
+    const store = new StubGraphKMStore();
+    await mk(store).storeEntity({ name: 'HandMade', entityType: 'Detail' }, { team: 'coding' });
+    const md = store.putEntityArgs[0].metadata as Record<string, unknown>;
+    assert.ok(!('isScaffoldNode' in md), 'must not invent a scaffold flag');
+    assert.ok(!('hierarchyLevel' in md));
+  });
+
+  it('sourceMetadata.parentEntityName wins over source.parentId', async () => {
+    const store = new StubGraphKMStore();
+    await mk(store).storeEntity(
+      {
+        name: 'C',
+        entityType: 'SubComponent',
+        parentId: 'LooseField',
+        metadata: { parentEntityName: 'CanonicalMapperStamp' },
+      },
+      { team: 'coding' },
+    );
+    const md = store.putEntityArgs[0].metadata as Record<string, unknown>;
+    assert.equal(md.parentEntityName, 'CanonicalMapperStamp');
+  });
+
+  it('an upsert PRESERVES metadata a previous write stamped', async () => {
+    // The wave-4 regression, and the reason change A needed the
+    // read-modify-write: putEntity ends in graph.mergeNode, a SHALLOW merge, so
+    // a partial `metadata` object replaced the stored one wholesale. Wave 4
+    // passes only {validated_file_path, has_insight_document} and was thereby
+    // erasing everything waves 1-3 wrote. Measured on 2026-09-20: 181
+    // insight-bearing rows, ZERO of which still had parentEntityName.
+    const store = new StubGraphKMStore();
+    store.seed(
+      withMetadata('MultiUserFileManager', 'SubComponent', {
+        parentEntityName: 'LiveLoggingSystem',
+        hierarchyLevel: 2,
+        ontology: { ontologyClass: 'SubComponent' },
+        source: 'wave-analysis',
+        subsystem: 'wave-analysis',
+      }),
+    );
+
+    await mk(store).storeEntity(
+      {
+        name: 'MultiUserFileManager',
+        entityType: 'SubComponent',
+        metadata: { validated_file_path: '/x.md', has_insight_document: true },
+      },
+      { team: 'coding' },
+    );
+
+    const md = store.putEntityArgs[0].metadata as Record<string, unknown>;
+    assert.equal(md.parentEntityName, 'LiveLoggingSystem', 'wave-4 must not erase the parent');
+    assert.equal(md.hierarchyLevel, 2);
+    assert.equal(md.source, 'wave-analysis');
+    assert.ok(md.ontology, 'the ontology block must survive an insight stamp');
+    assert.equal(md.validated_file_path, '/x.md', 'and the new keys still land');
+    assert.equal(md.has_insight_document, true);
+  });
+
+  it('still binds the EXISTING id when hierarchy fields are present', async () => {
+    // Non-regression for the upsert path with the new stamps in play.
+    const store = new StubGraphKMStore();
+    store.seed(freshEntity('LiveLoggingSystem', 'Component'));
+    await mk(store).storeEntity(
+      { name: 'LiveLoggingSystem', entityType: 'Component', parentId: 'Coding', level: 1 },
+      { team: 'coding' },
+    );
+    assert.equal(store.putEntityCalls.length, 1);
+    assert.equal(
+      store.putEntityArgs[0].id,
+      freshEntity('LiveLoggingSystem', 'Component').id,
+      'must reuse the existing EntityId',
+    );
+  });
+});

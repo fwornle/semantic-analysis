@@ -122,6 +122,14 @@ export class WaveController {
   private docAnalysis: DocumentationAnalysisResult | null = null;
   /** Track all entity names persisted across waves — used for cross-wave parent validation */
   private persistedEntityNames: Set<string> = new Set();
+
+  /**
+   * Name of the Project root every wave-emitted entity ultimately hangs from.
+   * `ensureProjectAnchor` mints it when absent, and the anchor pass falls back
+   * to it when no closer parent can be found — so an entity can never be left
+   * with no incoming structural edge.
+   */
+  private readonly projectAnchorName = 'Coding';
   /** Phase 42 Plan 06 — stable runId for the current `ukb full` invocation.
    *  Stamped on every entity emitted by wave1/wave2/wave3 via
    *  `canonical-mapper.toCanonicalEntity`. Initialized at the start of
@@ -2347,18 +2355,18 @@ export class WaveController {
     }
     try {
       const existing = await this.kmCoreAdapter.queryEntities({ entityType: 'Project' });
-      if (existing.some((e) => e.name === 'Coding')) {
+      if (existing.some((e) => e.name === this.projectAnchorName)) {
         // Already present — idempotent re-run. Still seed the name: the
         // relationship sweep drops edges whose endpoints it cannot find in
         // persistedEntityNames, and returning without seeding made every
         // `Coding -> Component` edge depend on the init-time seed having
         // loaded the Project.
-        this.persistedEntityNames.add('Coding');
+        this.persistedEntityNames.add(this.projectAnchorName);
         return;
       }
       await this.kmCoreAdapter.storeEntity(
         {
-          name: 'Coding',
+          name: this.projectAnchorName,
           entityType: 'Project',
           ontologyClass: 'Project',
           observations: ['Coding project root entity (anchor for wave-analysis emissions).'],
@@ -2374,7 +2382,7 @@ export class WaveController {
       // Track in the local persistedEntityNames set so the relation sweep
       // (and any future caller within the same wave) does not skip Coding-targeted
       // edges as "unknown target".
-      this.persistedEntityNames.add('Coding');
+      this.persistedEntityNames.add(this.projectAnchorName);
       log(
         `[WaveController] Coding Project anchor minted (cold-start) for runId=${runId}`,
         'info',
@@ -2555,7 +2563,13 @@ export class WaveController {
     for (const e of entities) {
       if (alreadyAnchored.has(e.name)) continue;
       try {
-        const inRels = await this.kmCoreAdapter.queryIncomingRelations(e.name);
+        // e.entityType disambiguates a duplicated name. Without it this asks
+        // about the OLDEST node wearing the name: on 2026-09-20 a new Detail
+        // named EntityPatternAnalyzer inherited the 24 incoming edges of a
+        // Sep-7 SubComponent with the same name, was marked anchored, and was
+        // left in the graph with no edges at all. Every batch that run logged
+        // `added=0 skipped=N` — the pass did nothing, and looked like it had.
+        const inRels = await this.kmCoreAdapter.queryIncomingRelations(e.name, e.entityType);
         if (inRels.some((r) => r.type === 'contains' || r.type === 'parent-child')) {
           alreadyAnchored.add(e.name);
         }
@@ -2575,11 +2589,17 @@ export class WaveController {
         anchorEdgesSkipped += 1;
         continue;
       }
-      const parent = this.findBestParent(e.name, entities);
+      // `findBestParent` returning nothing used to end the entity's chance of
+      // ever being anchored — it was counted as "skipped" and left orphaned,
+      // with only a stderr line to say so. This pass exists precisely to
+      // guarantee that never happens, and the team's Project root (minted by
+      // ensureProjectAnchor above) is always a valid last-resort parent, so
+      // fall back to it rather than giving up.
+      const parent = this.findBestParent(e.name, entities) ?? this.projectAnchorName;
       if (!parent) {
         anchorEdgesSkipped += 1;
         process.stderr.write(
-          `[WaveController] anchor pass: no parent found for ${e.name} (runId=${runId})\n`,
+          `[WaveController] anchor pass: no parent AND no project anchor for ${e.name} (runId=${runId})\n`,
         );
         continue;
       }
@@ -2597,6 +2617,9 @@ export class WaveController {
           e.name,
           'contains',
           { source: 'wave-analysis', runId },
+          // Same duplicate-name hazard as the detection above: without the
+          // type, this edge attaches to whichever namesake is oldest.
+          { to: e.entityType },
         );
         anchorEdgesAdded += 1;
       } catch (err) {
@@ -2848,7 +2871,7 @@ export class WaveController {
    */
   private async generateInsightsForWaveEntities(
     waveResults: WaveResult[],
-  ): Promise<{ generated: number; failed: number; skippedDiagrams: number }> {
+  ): Promise<{ generated: number; failed: number; skippedDiagrams: number; insightEntitiesStored: number; insightEntityErrors: number }> {
     // Collect all entities and relationships from all waves
     const allEntities = waveResults.flatMap(wr => wr.agentOutputs.flatMap(ao => ao.entities));
     const allRelationships = waveResults.flatMap(wr => wr.agentOutputs.flatMap(ao => ao.relationships));
@@ -2860,7 +2883,7 @@ export class WaveController {
 
     if (allEntities.length === 0) {
       log('[WaveController] No entities to generate insights for', 'warning');
-      return { generated: 0, failed: 0, skippedDiagrams: 0 };
+      return { generated: 0, failed: 0, skippedDiagrams: 0, insightEntitiesStored: 0, insightEntityErrors: 0 };
     }
 
     // In mock mode, skip real insight generation (it makes LLM calls)
@@ -2868,7 +2891,7 @@ export class WaveController {
       const mockDelay = getMockDelay(this.repositoryPath);
       await new Promise(resolve => setTimeout(resolve, mockDelay));
       log('[WaveController] Mock mode: skipping insight generation', 'info', { entityCount: allEntities.length });
-      return { generated: allEntities.length, failed: 0, skippedDiagrams: 0 };
+      return { generated: allEntities.length, failed: 0, skippedDiagrams: 0, insightEntitiesStored: 0, insightEntityErrors: 0 };
     }
 
     // Instantiate InsightGenerationAgent ONCE (constructor creates dirs, checks PlantUML)
@@ -2877,6 +2900,12 @@ export class WaveController {
     let generated = 0;
     let failed = 0;
     let skippedDiagrams = 0;
+    // Insight-ENTITY persistence, tracked separately from `generated`: a
+    // document can be written successfully while its graph node fails, and
+    // conflating the two is what let "wave 4 succeeded" coexist with an empty
+    // History sidebar for months.
+    let insightEntitiesStored = 0;
+    let insightEntityErrors = 0;
     const planned = allEntities.length;
 
     // Emit the plan upfront so the dashboard's Insight Generation panel
@@ -2962,9 +2991,24 @@ export class WaveController {
                     entityType: entity.type,
                     observations: entity.observations,
                     significance: entity.significance,
+                    // Carried so the adapter's hierarchy stamp has something to
+                    // work with on this path too — belt and braces alongside
+                    // the read-modify-write in storeEntity.
+                    parentId: entity.parentId,
+                    level: entity.level,
                     metadata: {
                       validated_file_path: result.filePath,
                       has_insight_document: true,
+                      // `source` is what the timeline reads to colour a session
+                      // Batch rather than Auto: observations-api-server.mjs
+                      // matches `metadata.source` against
+                      // BATCH_SOURCES = {manual, wave-analysis}. Waves 1-3 stamp
+                      // it via mapEntityToSharedMemory; this call site did not,
+                      // and because putEntity's mergeNode REPLACES metadata
+                      // wholesale, this write was erasing the stamp waves 1-3
+                      // had just made — which is why the session tick covering
+                      // a UKB run rendered pink.
+                      source: 'wave-analysis',
                     },
                   },
                   { team: this.team },
@@ -2974,6 +3018,84 @@ export class WaveController {
               }
             } catch (updateErr) {
               log(`[WaveController] Failed to update metadata for ${entity.name}: ${updateErr}`, 'warning');
+            }
+
+            // --- Persist the insight as a first-class graph entity ---
+            //
+            // Wave 4 used to write the document to disk and stamp the SOURCE
+            // entity with `validated_file_path` / `has_insight_document`, and
+            // stop there. The result was that a whole wave of work — 75 LLM
+            // calls and 170K output tokens on 2026-09-20 — produced 73
+            // markdown files and NOT ONE queryable node: across the entire
+            // graph there were 1021 entities marked `wave-analysis` and zero
+            // of them were Insights, while all 900 Insight nodes came from the
+            // online (ETM/consolidator) path. The viewer's History sidebar
+            // filters to `Insight` and renders a Batch badge that could
+            // therefore never appear, and nothing could ask the graph "what
+            // did the last UKB run conclude about X?".
+            //
+            // The online writer's contract is `X --has_insight--> Insight`
+            // (ObservationConsolidator; see scripts/repair-orphan-digest-
+            // insight-edges.mjs). We emit the same edge from the entity the
+            // insight is ABOUT, which both anchors the node — `has_insight`
+            // counts as structural to anchor-unstructured-entities.mjs, so it
+            // can never land as an orphan — and says more than hanging it off
+            // the Project root would.
+            try {
+              if (this.kmCoreAdapter) {
+                // Deliberately NOT `entity.name`: a node sharing its source's
+                // name is exactly the duplicate-name collision that made the
+                // anchor pass attach edges to the wrong node.
+                const insightName = `${entity.name} — Insight`;
+                await this.kmCoreAdapter.storeEntity(
+                  {
+                    name: insightName,
+                    entityType: 'Insight',
+                    ontologyClass: 'Insight',
+                    observations: [
+                      `Insight document generated by wave-analysis for ${entity.name} (${entity.type}).`,
+                      `Source document: ${result.filePath}`,
+                      ...(result.diagramCount > 0
+                        ? [`Includes ${result.diagramCount} generated diagram(s).`]
+                        : []),
+                    ],
+                    significance: entity.significance,
+                    metadata: {
+                      // `source` is what learning-source.ts reads to badge this
+                      // Batch rather than Auto in the viewer; `subsystem` is the
+                      // fallback key it checks second. Both, so neither path
+                      // misclassifies it.
+                      source: 'wave-analysis',
+                      subsystem: 'wave-analysis',
+                      validated_file_path: result.filePath,
+                      insight_for: entity.name,
+                      diagramCount: result.diagramCount,
+                    },
+                  },
+                  { team: this.team },
+                );
+
+                await this.kmCoreAdapter.storeRelationship(
+                  entity.name,
+                  insightName,
+                  'has_insight',
+                  { source: 'wave-analysis', team: this.team, confidence: 1.0 },
+                  // Bind both ends by type: `entity.name` may be duplicated in
+                  // the graph, and the edge has to reach the node we just wrote.
+                  { from: entity.type, to: 'Insight' },
+                );
+                insightEntitiesStored += 1;
+              }
+            } catch (insightEntityErr) {
+              // Fail-soft: the document is already on disk, so losing the node
+              // costs queryability, not the analysis. Counted and logged so a
+              // systematic failure is visible in the wave summary rather than
+              // being discovered later as an empty History sidebar.
+              insightEntityErrors += 1;
+              log(
+                `[WaveController] Failed to persist Insight entity for ${entity.name}: ${insightEntityErr}`,
+                'warning',
+              );
             }
           } else {
             failed++;
@@ -2990,7 +3112,15 @@ export class WaveController {
     // Execute with bounded concurrency (2 parallel to be conservative with LLM rate limits)
     await this.runWithConcurrency(insightTasks, 2);
 
-    return { generated, failed, skippedDiagrams };
+    // Say it out loud. `generated` counts DOCUMENTS; if the graph nodes did not
+    // land, the run looks successful and the knowledge is unqueryable — which
+    // is exactly how this went unnoticed. A mismatch belongs in the log.
+    log(
+      `[WaveController] Wave 4: ${generated} document(s), ${insightEntitiesStored} Insight entit(ies) persisted, ${insightEntityErrors} entity error(s)`,
+      insightEntityErrors > 0 || (generated > 0 && insightEntitiesStored === 0) ? 'warning' : 'info',
+    );
+
+    return { generated, failed, skippedDiagrams, insightEntitiesStored, insightEntityErrors };
   }
 
   /**
