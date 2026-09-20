@@ -2049,18 +2049,54 @@ Respond ONLY with a JSON object. Do not include markdown fences or any text outs
    * @param hadCgrContext - Whether CGR context was injected into the LLM prompt
    * @returns Tagged observations
    */
-  static autoTagObservations(observations: string[], hadCgrContext: boolean): string[] {
+  /**
+   * Coerce one LLM-returned observation to a string.
+   *
+   * The parse site types the model's JSON as `{ observations?: string[] }` and
+   * casts — no validation — so a model that answers with OBJECTS instead of
+   * strings type-checks fine and corrupts the data downstream. That is exactly
+   * what happened: `tagPattern.test(obj)` stringifies to "[object Object]",
+   * fails to match, and the tagger emits the literal string
+   * "[LLM] [object Object]". Twelve wave-analysis entities had their entire
+   * description replaced by seven repetitions of it — the rendered entity
+   * panel showed nothing else.
+   *
+   * A string wins. An object gets its first plausible text field. Anything
+   * else is JSON-stringified rather than silently coerced, so a future shape
+   * change is legible in the data instead of becoming "[object Object]" again.
+   */
+  static normalizeObservation(obs: unknown): string {
+    if (typeof obs === 'string') return obs;
+    if (obs && typeof obs === 'object') {
+      const rec = obs as Record<string, unknown>;
+      for (const key of ['observation', 'text', 'description', 'content', 'note', 'summary', 'value']) {
+        const v = rec[key];
+        if (typeof v === 'string' && v.trim().length > 0) return v;
+      }
+      try {
+        return JSON.stringify(obs);
+      } catch {
+        return '';
+      }
+    }
+    return obs === null || obs === undefined ? '' : String(obs);
+  }
+
+  static autoTagObservations(observations: readonly unknown[], hadCgrContext: boolean): string[] {
     const tagPattern = /^\[(CGR|LLM|LLM\+CGR)\]/;
     const codeRefPattern = /[A-Z][a-z]+[A-Z]|\.(ts|js|py|yaml|json)\b|\/[\w-]+\//;
 
-    return observations.map(obs => {
-      // Skip already-tagged observations
-      if (tagPattern.test(obs)) return obs;
+    return observations
+      .map(raw => SemanticAnalysisAgent.normalizeObservation(raw))
+      .filter(obs => obs.trim().length > 0)
+      .map(obs => {
+        // Skip already-tagged observations
+        if (tagPattern.test(obs)) return obs;
 
-      if (hadCgrContext && codeRefPattern.test(obs)) {
-        return `[LLM+CGR] ${obs}`;
-      }
-      return `[LLM] ${obs}`;
-    });
+        if (hadCgrContext && codeRefPattern.test(obs)) {
+          return `[LLM+CGR] ${obs}`;
+        }
+        return `[LLM] ${obs}`;
+      });
   }
 }
