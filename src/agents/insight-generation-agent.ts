@@ -480,8 +480,6 @@ export class InsightGenerationAgent {
       }
     }
 
-    // Synthesize overview from observations (first 2-3 most descriptive)
-    const overview = this.synthesizeOverview(entityName, observations);
 
     // Categorize observations by type
     const categorized = this.categorizeObservations(observations);
@@ -492,7 +490,21 @@ export class InsightGenerationAgent {
     // Header
     sections.push(`# ${entityName}\n`);
     sections.push(`**Type:** ${entityType}\n`);
-    sections.push(`${overview}\n`);
+    // NO raw-observation overview here. This slot used to hold
+    // synthesizeOverview(), which returned the LONGEST observation verbatim —
+    // and longest is reliably the least readable thing available: the
+    // machine-tagged `[Code References] file.js — \`snippet\`; file.js — …`
+    // blob, dumped as one unbroken paragraph between the title and the real
+    // document. 239 of 1264 documents opened that way.
+    //
+    // It was also redundant. This function returns null when
+    // `deepInsightContent` is absent, so a file is only ever written when the
+    // LLM document exists — and that document already opens with its own
+    // "## What It Is" overview, written for a human. The raw dump added noise
+    // ahead of the thing it duplicated.
+    //
+    // The evidence is not lost: buildCodeEvidenceSection() appends the same
+    // observations as a structured Code Evidence section further down.
 
     // USE DEEP INSIGHT CONTENT if available (LLM-generated analysis)
     // If LLM synthesis failed, return null to signal "do not write this file"
@@ -517,24 +529,6 @@ export class InsightGenerationAgent {
     sections.push(`*Generated from ${observations.length} observations*\n`);
 
     return sections.join('\n');
-  }
-
-  /**
-   * Synthesize a concise overview from observations
-   */
-  private synthesizeOverview(entityName: string, observations: string[]): string {
-    // Find the most descriptive observation (longest that's not a rule/command)
-    const descriptive = observations
-      .filter(obs => !obs.toLowerCase().startsWith('use ') && !obs.toLowerCase().startsWith('never '))
-      .sort((a, b) => b.length - a.length)
-      .slice(0, 2);
-
-    if (descriptive.length > 0) {
-      // Use the full most-descriptive observation as overview (no truncation)
-      return descriptive[0];
-    }
-
-    return `Technical documentation for ${entityName}.`;
   }
 
   /**
