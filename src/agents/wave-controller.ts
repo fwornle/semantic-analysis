@@ -573,7 +573,18 @@ export class WaveController {
           const km = await import('@fwornle/km-core');
           const dbPath = path.join(this.repositoryPath, '.data', 'knowledge-graph', 'leveldb');
           const exportDir = path.join(this.repositoryPath, '.data', 'knowledge-graph', 'exports');
-          const ontologyDir = path.join(this.repositoryPath, '.data', 'ontologies');
+          // The SAME curated dir obs-api opens (its KG_ONTOLOGY_DIR). Not
+          // `.data/ontologies`, which carries the host upper WITHOUT the
+          // LearningArtifact axis: a standalone wave run reading that one got
+          // a registry with no Observation/Digest/Insight in it, while the
+          // in-process run (which uses the caller's injected store) got all
+          // 61 classes. Same database, two vocabularies, decided by how the
+          // process happened to be launched.
+          //
+          // The curated dir is a strict superset and its members are symlinks
+          // back to the canonical files, so there is one copy of each
+          // ontology on disk and no regeneration step to forget.
+          const ontologyDir = path.join(this.repositoryPath, '.data', 'ontologies', 'obs-api');
           const store = new km.GraphKMStore({
             dbPath,
             exportDir,
