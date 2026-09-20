@@ -281,7 +281,11 @@ IMPORTANT: Return ONLY the JSON object, no markdown code blocks.`;
             taskType: 'semantic_analysis',
             agentId: 'wave1_project_enrich',
             tier: 'standard',
-            maxTokens: 2048,
+            // 2026-09-20: 20 of 190 wave-1 calls returned output_tokens
+            // EXACTLY 2048 — the ceiling, not the answer's natural length —
+            // and the cut replies failed to parse. 4096 clears the observed
+            // distribution (median ~1330) with real headroom.
+            maxTokens: 4096,
             temperature: 0.7,
             timeout: 60_000,
             responseFormat: { type: 'json_object' },
@@ -471,7 +475,8 @@ IMPORTANT: Return ONLY the JSON object, no markdown code blocks or surrounding t
         taskType: 'wave_component_analysis',
         agentId: 'wave1_project',
         tier: 'standard',
-        maxTokens: 2048,
+        // Same ceiling, same evidence as the enrich call above.
+        maxTokens: 4096,
         temperature: 0.7,
         timeout: 60_000,
         responseFormat: { type: 'json_object' },
@@ -503,7 +508,10 @@ IMPORTANT: Return ONLY the JSON object, no markdown code blocks or surrounding t
       // parse error and a one-sentence fallback, which the downstream
       // "single-sentence stubs" constraint then rejected — losing the whole
       // component. parseLlmJson escapes the control characters and carries on.
-      const parsedResult = parseLlmJson<Record<string, unknown>>(content);
+      // salvageTruncated: the other recoverable failure at this boundary is a
+      // reply cut at the output ceiling, which costs the component the same
+      // way the control character used to.
+      const parsedResult = parseLlmJson<Record<string, unknown>>(content, { salvageTruncated: true });
       if (parsedResult.value === null) {
         throw new Error(parsedResult.error || 'unparseable LLM reply');
       }
@@ -511,6 +519,12 @@ IMPORTANT: Return ONLY the JSON object, no markdown code blocks or surrounding t
         log(
           `[Wave1ProjectAgent] Repaired control characters in LLM reply for ${component.name}`,
           'info',
+        );
+      }
+      if (parsedResult.truncated) {
+        log(
+          `[Wave1ProjectAgent] LLM reply for ${component.name} was truncated at the output ceiling — recovered the complete prefix`,
+          'warning',
         );
       }
       const parsed = parsedResult.value;

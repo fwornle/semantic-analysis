@@ -18,8 +18,23 @@
  *
  * The repair is deliberately narrow. It escapes control characters that appear
  * INSIDE string literals and changes nothing else — no trailing-comma fixing,
- * no quote juggling, no truncation recovery. A reply that is malformed in any
- * other way still fails, loudly, rather than being silently reinterpreted.
+ * no quote juggling. A reply that is malformed in any other way still fails,
+ * loudly, rather than being silently reinterpreted.
+ *
+ * ── Truncation is the one other recoverable failure, and it is OPT-IN ───────
+ * A reply cut off at the provider's output-token ceiling is not malformed
+ * output, it is incomplete output: every element before the cut is intact and
+ * only the last one is a fragment. Callers that want the intact prefix pass
+ * `{ salvageTruncated: true }` and get it, with `truncated: true` saying the
+ * value is PARTIAL. Callers that do not pass it keep the strict contract —
+ * because for most callers a half-answer is worse than a failure they can see.
+ *
+ * Observed on 2026-09-20: wave-2 asked for 4096 output tokens and 11 of 98
+ * calls came back at exactly 4096, the reply cut mid-string ("Unterminated
+ * string in JSON at position 10295"). Each one discarded a whole component's
+ * sub-component analysis — eight complete entities thrown away because a
+ * ninth was half-written. The budgets were raised at the call sites; this is
+ * the floor under them, because a ceiling can always be reached again.
  */
 
 /** Outcome of a parse attempt. `repaired` distinguishes clean from salvaged. */
@@ -28,8 +43,25 @@ export interface LlmJsonParse<T> {
   value: T | null;
   /** True when the reply only parsed after control characters were escaped. */
   repaired: boolean;
+  /**
+   * True when `value` came from a TRUNCATED reply whose incomplete tail was
+   * dropped. The value is well-formed but PARTIAL — some elements the model
+   * intended to emit are missing. Only ever true when the caller opted in.
+   */
+  truncated: boolean;
   /** Parser message when `value` is null. */
   error?: string;
+}
+
+/** Caller-controlled widening of what counts as recoverable. */
+export interface LlmJsonParseOptions {
+  /**
+   * Recover a reply cut off at the output-token ceiling by discarding the
+   * final, incomplete element and closing the structures still open around
+   * it. Off by default: it trades completeness for availability, and only a
+   * caller that can use a partial answer should make that trade.
+   */
+  salvageTruncated?: boolean;
 }
 
 /** Strip a leading ```json fence and its closing counterpart. */
@@ -83,27 +115,101 @@ export function escapeControlCharsInStrings(json: string): string {
 }
 
 /**
+ * Cut a truncated JSON document back to its last COMPLETE element and close
+ * the structures left open around it.
+ *
+ * Walks once, tracking string state and the bracket stack, and remembers the
+ * offset just past every `}` / `]` that closed a NESTED structure. That offset
+ * is the last point at which the document was whole: everything before it is a
+ * finished element, everything after it is the fragment the ceiling cut off.
+ *
+ * Returns null when there is no such point — a reply truncated before its first
+ * nested element closed carries nothing worth keeping, and inventing a value
+ * for it would be the silent reinterpretation this module exists to avoid.
+ */
+export function truncateToLastCompleteElement(json: string): string | null {
+  const stack: string[] = [];
+  let inString = false;
+  let escaped = false;
+  let safeEnd = -1;
+  let safeStack: string[] = [];
+
+  for (let i = 0; i < json.length; i++) {
+    const ch = json[i];
+
+    if (escaped) { escaped = false; continue; }
+    if (inString) {
+      if (ch === '\\') escaped = true;
+      else if (ch === '"') inString = false;
+      continue;
+    }
+
+    if (ch === '"') { inString = true; continue; }
+    if (ch === '{' || ch === '[') { stack.push(ch === '{' ? '}' : ']'); continue; }
+    if (ch === '}' || ch === ']') {
+      stack.pop();
+      // Only a NESTED close marks a usable cut: closing the outermost
+      // structure means the document was never truncated in the first place.
+      if (stack.length > 0) {
+        safeEnd = i + 1;
+        safeStack = [...stack];
+      }
+      continue;
+    }
+  }
+
+  if (safeEnd < 0) return null;
+
+  // Drop a dangling separator, then close what is still open, innermost first.
+  const head = json.slice(0, safeEnd).replace(/,\s*$/, '');
+  return head + safeStack.reverse().join('');
+}
+
+/**
  * Parse an LLM reply as JSON, repairing unescaped control characters if the
- * first attempt fails.
+ * first attempt fails, and — only when the caller asks — recovering the intact
+ * prefix of a reply truncated at the output-token ceiling.
  *
  * Never throws: callers decide what a failure means for them.
  */
-export function parseLlmJson<T = unknown>(content: string): LlmJsonParse<T> {
+export function parseLlmJson<T = unknown>(
+  content: string,
+  options: LlmJsonParseOptions = {},
+): LlmJsonParse<T> {
   const cleaned = stripFence(content);
 
   try {
-    return { value: JSON.parse(cleaned) as T, repaired: false };
+    return { value: JSON.parse(cleaned) as T, repaired: false, truncated: false };
   } catch (first) {
+    // The FIRST error describes the reply as the model wrote it, which is the
+    // one worth reporting; anything later is an artefact of a repair attempt.
+    const firstMessage = first instanceof Error ? first.message : String(first);
+
+    const escapedText = escapeControlCharsInStrings(cleaned);
     try {
-      return { value: JSON.parse(escapeControlCharsInStrings(cleaned)) as T, repaired: true };
-    } catch (second) {
-      return {
-        value: null,
-        repaired: false,
-        // The FIRST error describes the reply as the model wrote it, which is
-        // the one worth reporting; the second is an artefact of the repair.
-        error: first instanceof Error ? first.message : String(second),
-      };
+      return { value: JSON.parse(escapedText) as T, repaired: true, truncated: false };
+    } catch {
+      // fall through to the truncation path
     }
+
+    if (options.salvageTruncated) {
+      // Try the escaped text first: a reply can be BOTH truncated and carry an
+      // unescaped newline, and the cut is easier to find once strings are sane.
+      for (const candidate of [escapedText, cleaned]) {
+        const salvaged = truncateToLastCompleteElement(candidate);
+        if (salvaged === null) continue;
+        try {
+          return {
+            value: JSON.parse(salvaged) as T,
+            repaired: candidate === escapedText && escapedText !== cleaned,
+            truncated: true,
+          };
+        } catch {
+          // this candidate did not yield valid JSON; try the next
+        }
+      }
+    }
+
+    return { value: null, repaired: false, truncated: false, error: firstMessage };
   }
 }

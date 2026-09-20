@@ -408,9 +408,23 @@ Write as if this is the only documentation a new team member will read about thi
         taskType: 'wave2_component_analysis',
         agentId: 'wave2_component',
         tier: 'standard',
-        maxTokens: 4096,
+        // 2026-09-20: 4096 was not a budget, it was a ceiling the reply hit —
+        // 11 of 98 wave-2 calls returned output_tokens EXACTLY 4096 and were
+        // cut mid-string ("Unterminated string in JSON at position 10295"),
+        // discarding the whole component's sub-component analysis each time.
+        // Median output is ~2100, so 8192 clears the observed distribution
+        // with headroom rather than sitting on its shoulder.
+        //
+        // Above 4096 the proxy switches the copilot leg to a streamed read
+        // (COPILOT_STREAM_MAXTOKENS_THRESHOLD) specifically to dodge the
+        // upstream gateway's response-time ceiling, so the larger budget
+        // takes the path built for it.
+        maxTokens: 8192,
         temperature: 0.7,
-        timeout: 60_000,
+        // Raised with the budget: a reply twice as long takes roughly twice as
+        // long to write (the 4096-token ones already ran ~24s), and trading a
+        // truncation for a timeout would not be a fix.
+        timeout: 120_000,
       });
 
       log(`[Wave2Agent] LLM call for ${input.l1Entity.name} via ${result.provider}/${result.model} (${result.tokens.total} tokens, ${result.latencyMs}ms)`, 'info');
@@ -441,12 +455,19 @@ Write as if this is the only documentation a new team member will read about thi
     const manifestNames = new Set(manifestChildren.map(c => c.name));
 
     try {
-      const parsedResult = parseLlmJson<L2AnalysisResponse>(responseText);
+      // salvageTruncated: a reply cut at the output ceiling still carries
+      // every sub-component before the cut. Discarding all of them because the
+      // last one is half-written is the failure this recovers from; the
+      // `truncated` flag makes the partial result visible instead of silent.
+      const parsedResult = parseLlmJson<L2AnalysisResponse>(responseText, { salvageTruncated: true });
       if (parsedResult.value === null) {
         throw new Error(parsedResult.error || 'unparseable LLM reply');
       }
       if (parsedResult.repaired) {
         log('[Wave2Agent] Repaired control characters in LLM reply', 'info');
+      }
+      if (parsedResult.truncated) {
+        log('[Wave2Agent] LLM reply was truncated at the output ceiling — recovered the complete prefix, the final sub-component was dropped', 'warning');
       }
       const parsed = parsedResult.value;
 

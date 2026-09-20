@@ -63,6 +63,14 @@ export interface AnalysisOptions {
    *  sites + the single ontology-classification call site all set this
    *  field in Phase 52). */
   process?: string;
+  /** Per-call output-token budget, forwarded to `/api/complete`.
+   *
+   *  Omitted, the proxy applies its own 4096 default — which on 2026-09-20
+   *  cut 4 of 202 wave-4 diagram replies off mid-line at output_tokens
+   *  EXACTLY 4096, sending a half-written PlantUML document to the repair
+   *  path. The budget belongs to the caller because only the caller knows
+   *  how long its document runs; this field is how it says so. */
+  maxTokens?: number;
 }
 
 export interface CodeAnalysisOptions {
@@ -400,7 +408,7 @@ export class SemanticAnalyzer {
   // --- Core Analysis Methods ---
 
   async analyzeContent(content: string, options: AnalysisOptions = {}): Promise<AnalysisResult> {
-    const { context, analysisType = "general", tier, taskType, timeout, process: processTag } = options;
+    const { context, analysisType = "general", tier, taskType, timeout, maxTokens, process: processTag } = options;
 
     await this.ensureInitialized();
 
@@ -446,6 +454,10 @@ export class SemanticAnalyzer {
             ...(typeof taskType === 'string' ? { taskType } : {}),
             ...(SemanticAnalyzer.currentAgentId ? { agentId: SemanticAnalyzer.currentAgentId } : {}),
             ...(typeof timeout === 'number' ? { timeout } : {}),
+            // Forwarded, not defaulted: an omitted budget must keep meaning
+            // "whatever the proxy decides", which is what every unmigrated
+            // caller already relies on.
+            ...(typeof maxTokens === 'number' ? { maxTokens } : {}),
           },
           this.llmService.getMetricsTracker(),
         );

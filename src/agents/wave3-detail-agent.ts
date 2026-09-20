@@ -426,12 +426,16 @@ Write as if this is the only documentation available about this detail.
    */
   private parseL3Response(responseText: string): L3DiscoveryResponse {
     try {
-      const parsedResult = parseLlmJson<L3DiscoveryResponse>(responseText);
+      // Same rationale as wave-2: keep the details that arrived intact.
+      const parsedResult = parseLlmJson<L3DiscoveryResponse>(responseText, { salvageTruncated: true });
       if (parsedResult.value === null) {
         throw new Error(parsedResult.error || 'unparseable LLM reply');
       }
       if (parsedResult.repaired) {
         log('[Wave3Agent] Repaired control characters in LLM reply', 'info');
+      }
+      if (parsedResult.truncated) {
+        log('[Wave3Agent] LLM reply was truncated at the output ceiling — recovered the complete prefix, the final detail was dropped', 'warning');
       }
       const parsed = parsedResult.value;
 

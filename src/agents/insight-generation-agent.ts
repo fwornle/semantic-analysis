@@ -2509,6 +2509,12 @@ Best practices, rules, and conventions for using this correctly. What should dev
         context: `PlantUML ${type} diagram generation`,
         provider: 'auto',
         timeout: 60000,  // Phase 42.2 Plan 06 follow-up — prevent Wave 4 hang on stalled proxy
+        // 2026-09-20: 4 of 202 diagram calls returned output_tokens EXACTLY
+        // 4096 — a PlantUML document cut mid-line, which lands in the repair
+        // path rather than in the graph. A diagram is one indivisible
+        // document: unlike a JSON array there is no complete prefix to
+        // salvage, so the budget is the only lever.
+        maxTokens: 8192,
         process: PROCESS_TAGS.WAVE4_DIAGRAM,  // Phase 52 D-09
       });
 
