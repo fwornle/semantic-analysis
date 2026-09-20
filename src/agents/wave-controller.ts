@@ -2905,6 +2905,7 @@ export class WaveController {
     // conflating the two is what let "wave 4 succeeded" coexist with an empty
     // History sidebar for months.
     let insightEntitiesStored = 0;
+    let skippedForEvidence = 0;
     let insightEntityErrors = 0;
     const planned = allEntities.length;
 
@@ -2949,6 +2950,32 @@ export class WaveController {
             if (artifacts.codeReferences?.length > 0) {
               enrichedObservations.push(`[Code References] ${artifacts.codeReferences.join('; ')}`);
             }
+          }
+
+          // FIX 1 — refuse to document an entity whose evidence does not
+          // describe it. The analyser sets this when the files it was handed do
+          // not implement the entity, which happens routinely because retrieval
+          // matches FILENAME substrings against the entity name plus its
+          // PARENT's keywords: an entity whose name appears in no path quietly
+          // receives its parent's neighbourhood instead.
+          //
+          // Before this gate the signal existed only as prose inside an
+          // observation, so wave 4 consumed it as knowledge and produced a
+          // confident technical document built on inference — e.g.
+          // CodingLowerOntologySource, 5469 chars reasoned from copilot.sh,
+          // opencode.sh and pi.sh, none of which reference it. No document is
+          // better than a plausible wrong one: the entity keeps its
+          // observations and is retried on the next run.
+          const entityMeta = ((entity as unknown as { metadata?: Record<string, unknown> }).metadata) ?? {};
+          if (entityMeta.evidenceGap === true) {
+            skippedForEvidence += 1;
+            log(
+              `[WaveController] Skipping insight for ${entity.name}: evidence gap — ${
+                String(entityMeta.evidenceGapReason ?? 'supplied files do not implement it')
+              }`,
+              'warning',
+            );
+            return; // one async task per entity — not a loop body
           }
 
           process.stderr.write(`[WaveController] Insight: ${entity.name} level=${entityLevel} diagrams=${generateDiagrams}\n`);
@@ -3145,6 +3172,14 @@ export class WaveController {
       insightEntityErrors > 0 || (generated > 0 && insightEntitiesStored === 0) ? 'warning' : 'info',
     );
 
+    if (skippedForEvidence > 0) {
+      log(
+        `[WaveController] ${skippedForEvidence} insight document(s) skipped for evidence gaps — `
+        + `the retrieved files did not implement those entities. Their observations are kept and `
+        + `they are retried next run.`,
+        'warning',
+      );
+    }
     return { generated, failed, skippedDiagrams, insightEntitiesStored, insightEntityErrors };
   }
 

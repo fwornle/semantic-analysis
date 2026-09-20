@@ -543,7 +543,7 @@ export class InsightGenerationAgent {
     serenaAnalysis: SerenaAnalysisResult | null;
     additionalContext?: string;
     availableDiagrams?: Array<{ type: string; markdownRef: string }>;
-  }): Promise<string> {
+  }): Promise<string | null> {
     const { entityName, entityType, observations, relations, serenaAnalysis } = params;
 
     log(`Generating deep insight for ${entityName} with ${observations.length} observations`, 'info');
@@ -590,6 +590,23 @@ Place each diagram image reference (the markdown syntax above, exactly as shown)
 4. SYNTHESIZE observations into coherent domain knowledge — do NOT write a chronological log of changes
 5. OMIT dates, commit hashes, and incremental change history — focus on the CURRENT state and design
 6. This document will be re-injected as context for future work — write it as a reference manual, not a changelog
+
+**IF THE OBSERVATIONS DO NOT DESCRIBE THIS COMPONENT, SAY SO AND STOP.**
+Reply with exactly INSUFFICIENT_EVIDENCE: <one sentence on what is missing>
+and nothing else. That is a complete, correct answer — not a failure.
+
+Use it when the observations are about the parent or siblings rather than
+"${entityName}" itself, when they state that the supplied files do not implement
+or reference it, or when writing the sections below would mean inferring the
+component from thematically similar code rather than describing it.
+
+This exists because the alternative is worse. File retrieval selects candidates
+by FILENAME substring, so it regularly supplies a parent component's general
+neighbourhood instead of this entity's implementation. Asked for a full document
+regardless, the only honest move left is to flag the gap in a paragraph and then
+fill every section with inference anyway — which yields a confident-looking
+reference manual that is guesswork. A refusal here costs one document; a guess
+enters the knowledge base and is re-injected as context for future work.
 
 **Source Observations:**
 ${observationsText}
@@ -646,8 +663,24 @@ Best practices, rules, and conventions for using this correctly. What should dev
           content = content.slice(0, -3);
         }
 
-        log(`Deep insight generated successfully (${content.length} chars, provider: ${result.provider})`, 'info');
-        return content.trim();
+        const trimmed = content.trim();
+
+        // FIX 2 — honour the abstention. Without this branch the refusal itself
+        // becomes the document body: "INSUFFICIENT_EVIDENCE: …" written to disk
+        // and re-injected as context, which is worse than the guess it replaced.
+        // Returning null routes into buildDocument's existing no-LLM-content
+        // path, which skips writing the file entirely.
+        if (/^INSUFFICIENT_EVIDENCE\b/i.test(trimmed)) {
+          const reason = trimmed.replace(/^INSUFFICIENT_EVIDENCE:?\s*/i, '').split('\n')[0];
+          log(
+            `Insight declined for ${entityName}: ${reason || 'observations do not describe this component'}`,
+            'warning',
+          );
+          return null;
+        }
+
+        log(`Deep insight generated successfully (${trimmed.length} chars, provider: ${result.provider})`, 'info');
+        return trimmed;
       }
 
       log('LLM returned empty insights', 'warning');

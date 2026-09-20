@@ -1976,6 +1976,10 @@ Analyze this code component and produce a JSON response with:
 2. "patterns" - An array of architectural patterns discovered (e.g. "Observer pattern for event handling", "Repository pattern for data access")
 3. "architectureNotes" - An array of architecture observations (e.g. "Uses dependency injection via constructor", "Tight coupling between X and Y")
 4. "codeReferences" - An array of specific file/line references grounding the analysis (e.g. "src/auth.ts:45 - JWT validation")
+5. "evidenceGap" - Boolean. Set TRUE when the code files above do NOT implement or reference "${input.entityName}" — i.e. you would have to infer the component from its parent/sibling descriptions or from thematically similar code in unrelated files. Set FALSE only when the supplied code actually contains this component.
+6. "evidenceGapReason" - One sentence naming what is missing, when evidenceGap is true. Omit otherwise.
+
+Setting evidenceGap TRUE is a correct and useful answer, not a failure. File retrieval selects candidates by FILENAME substring, so it routinely hands you a parent component's general neighbourhood rather than this entity's implementation. Saying so stops a confident document being built on inference; guessing does not.
 
 Respond ONLY with a JSON object. Do not include markdown fences or any text outside the JSON.`;
 
@@ -1998,7 +2002,14 @@ Respond ONLY with a JSON object. Do not include markdown fences or any text outs
       responseText = fenceMatch[1].trim();
     }
 
-    let parsed: { observations?: string[]; patterns?: string[]; architectureNotes?: string[]; codeReferences?: string[] };
+    let parsed: {
+      observations?: string[];
+      patterns?: string[];
+      architectureNotes?: string[];
+      codeReferences?: string[];
+      evidenceGap?: boolean;
+      evidenceGapReason?: string;
+    };
     try {
       parsed = JSON.parse(responseText);
     } catch {
@@ -2029,10 +2040,23 @@ Respond ONLY with a JSON object. Do not include markdown fences or any text outs
       model: result.model,
     });
 
+    if (parsed.evidenceGap === true) {
+      log(
+        `[SemanticAnalysisAgent] evidence gap for "${input.entityName}": ${parsed.evidenceGapReason ?? 'supplied files do not implement it'}`,
+        'warning',
+      );
+    }
+
     return {
       observations: parsed.observations || [],
       artifacts,
       traceData,
+      // Structured, not prose. The analyser has always been able to notice that
+      // the files it was handed do not implement the entity — it said so in an
+      // observation and nothing downstream could act on it, so the insight
+      // generator built a full technical document out of inference anyway.
+      evidenceGap: parsed.evidenceGap === true,
+      ...(parsed.evidenceGapReason ? { evidenceGapReason: parsed.evidenceGapReason } : {}),
     };
   }
 

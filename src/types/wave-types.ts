@@ -100,6 +100,19 @@ export interface AnalyzeEntityCodeResult {
   artifacts: AnalysisArtifacts;
   /** Trace data from the LLM call */
   traceData: EntityTraceData;
+  /**
+   * True when the supplied code files do not implement or reference the entity,
+   * so any analysis of it would be inference from parent/sibling context.
+   *
+   * File retrieval matches candidates by FILENAME substring against the entity
+   * name plus its PARENT's keywords (wave-controller getComponentFiles), so an
+   * entity whose name appears in no path silently receives its parent's general
+   * neighbourhood instead. Retrieval cannot fail — it always returns something —
+   * so this flag is the only signal that what came back is unrelated.
+   */
+  evidenceGap?: boolean;
+  /** One sentence naming what is missing, when evidenceGap is true. */
+  evidenceGapReason?: string;
 }
 
 // ============================================================================

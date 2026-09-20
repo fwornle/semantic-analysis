@@ -265,6 +265,20 @@ export class Wave2ComponentAgent {
           const existingCgrObs = entity.observations.filter(o => o.startsWith('[CGR]'));
           entity.observations = [...existingCgrObs, ...taggedObs];
           (entity as any)._analysisArtifacts = analysisResult.artifacts;
+          // Carry the structured evidence-gap flag onto the entity so wave 4 can
+          // refuse to write a document grounded in nothing. Prose saying "none of
+          // the supplied files implement this" was already being produced here and
+          // stored as the description; it just had no machine-readable form, so
+          // the insight generator consumed it as if it were knowledge.
+          if (analysisResult.evidenceGap) {
+            entity.metadata = {
+              ...(entity.metadata ?? {}),
+              evidenceGap: true,
+              ...(analysisResult.evidenceGapReason
+                ? { evidenceGapReason: analysisResult.evidenceGapReason }
+                : {}),
+            };
+          }
           (entity as any)._traceData = [analysisResult.traceData];
           log(`[Wave2] Enriched entity ${entity.name} via SemanticAnalysisAgent (${taggedObs.length} observations, CGR context: ${!!cgrPrompt})`, 'info');
         } catch (err) {
