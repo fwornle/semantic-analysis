@@ -1,5 +1,5 @@
 @startuml mcp-server-architecture
-!include /Users/q284340/Agentic/coding/docs/puml/_standard-style.puml
+!include _standard-style.puml
 
 title MCP Semantic Analysis Server - 14-Agent Architecture
 
