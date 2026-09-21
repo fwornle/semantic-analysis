@@ -405,6 +405,113 @@ describe('km-core-adapter — storeEntity upsert', () => {
   });
 });
 
+describe('km-core-adapter — a fresh run must not undo stage 5', () => {
+  /** A parent whose description the stage-5 synthesis pass wrote. */
+  function synthesisedParent(name: string, klass: string): StubEntity {
+    const e = freshEntity(name, klass);
+    e.description = `${name} coordinates its children into one subsystem.`;
+    e.metadata = {
+      ...e.metadata,
+      synthesizedBy: 'parent-description-synthesis',
+      rolledUpAt: '2026-09-21T06:38:00.000Z',
+      rollUpOf: 4,
+    };
+    return e;
+  }
+
+  it('keeps a synthesised parent description instead of the observation join', async () => {
+    const store = new StubGraphKMStore();
+    const parent = synthesisedParent('KnowledgeManagement', 'Component');
+    store.seed(parent);
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    await adapter.storeEntity(
+      {
+        name: 'KnowledgeManagement',
+        entityType: 'Component',
+        observations: ['The GraphifyGraph reader loads graph.json.', 'A second note.'],
+      },
+      { team: 'coding' },
+    );
+
+    assert.equal(
+      store.putEntityArgs[0].description,
+      parent.description,
+      'the observation join must not overwrite a synthesised parent description',
+    );
+  });
+
+  it('stashes the run observations rather than dropping them', async () => {
+    const store = new StubGraphKMStore();
+    store.seed(synthesisedParent('KnowledgeManagement', 'Component'));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    const observations = ['The GraphifyGraph reader loads graph.json.', 'A second note.'];
+    await adapter.storeEntity(
+      { name: 'KnowledgeManagement', entityType: 'Component', observations },
+      { team: 'coding' },
+    );
+
+    const meta = store.putEntityArgs[0].metadata as Record<string, unknown>;
+    assert.deepEqual(
+      meta.observations,
+      observations,
+      'preserving the description must not silently discard the run output',
+    );
+  });
+
+  it('an EXPLICIT description still wins — only the fabricated join is refused', async () => {
+    const store = new StubGraphKMStore();
+    store.seed(synthesisedParent('KnowledgeManagement', 'Component'));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    await adapter.storeEntity(
+      {
+        name: 'KnowledgeManagement',
+        entityType: 'Component',
+        description: 'A deliberate restatement.',
+        observations: ['ignored'],
+      },
+      { team: 'coding' },
+    );
+
+    assert.equal(store.putEntityArgs[0].description, 'A deliberate restatement.');
+  });
+
+  it('leaves a leaf alone — no stamp means the join is still the right answer', async () => {
+    const store = new StubGraphKMStore();
+    store.seed(freshEntity('GraphifyGraphReader', 'Detail'));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    await adapter.storeEntity(
+      { name: 'GraphifyGraphReader', entityType: 'Detail', observations: ['first', 'second'] },
+      { team: 'coding' },
+    );
+
+    assert.equal(store.putEntityArgs[0].description, 'first\n\nsecond');
+    const meta = store.putEntityArgs[0].metadata as Record<string, unknown>;
+    assert.equal(meta.observations, undefined, 'no stash on the normal path');
+  });
+
+  it('does not preserve when the stored row was never synthesised', async () => {
+    const store = new StubGraphKMStore();
+    store.seed(freshEntity('LoggingModule', 'SubComponent'));
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    await adapter.storeEntity(
+      { name: 'LoggingModule', entityType: 'SubComponent', observations: ['fresh'] },
+      { team: 'coding' },
+    );
+
+    assert.equal(store.putEntityArgs[0].description, 'fresh');
+  });
+});
+
 describe('km-core-adapter — name resolution is deterministic', () => {
   it('binds to the OLDEST duplicate, which is where the edges already are', async () => {
     const store = new StubGraphKMStore();
