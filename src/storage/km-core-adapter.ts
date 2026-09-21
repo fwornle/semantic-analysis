@@ -476,13 +476,17 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
 
     // Description: prefer explicit description; else join observations.
     let description = '';
-    if (typeof source.description === 'string') {
-      description = source.description;
-    } else if (Array.isArray(source.observations)) {
-      description = (source.observations as unknown[])
+    let observationsJoined = '';
+    if (Array.isArray(source.observations)) {
+      observationsJoined = (source.observations as unknown[])
         .map((o) => (typeof o === 'string' ? o : (o as { content?: unknown })?.content ?? ''))
         .filter(Boolean)
         .join('\n\n');
+    }
+    if (typeof source.description === 'string') {
+      description = source.description;
+    } else {
+      description = observationsJoined;
     }
 
     const now = new Date().toISOString();
@@ -532,6 +536,36 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
     // we never set `supersedes`.
     const existingEntity = await findEntityByName(name, entityType);
 
+    // A synthesised parent description is NOT overwritten by an observation
+    // join. `description` above falls back to `observations.join('\n\n')`,
+    // which for a scaffold parent (Project / Component / SubComponent) is the
+    // entity's own LLM notes — the very shape stage 5 replaced, so a fresh
+    // wave-analysis run would silently undo a whole-graph synthesis pass.
+    //
+    // Narrow by construction: it fires only when the caller supplied NO
+    // explicit description (so we were about to fabricate one) AND the stored
+    // row carries the synthesis stamp. An explicit description is a deliberate
+    // statement and still wins; a Detail/leaf, which has no stamp, is
+    // untouched and keeps the join that is the right answer for it.
+    //
+    // The observations are stashed rather than dropped — `metadata.observations`
+    // is an existing shape here (see editEntityObservations, which reads both
+    // "joined into description" and "array in metadata"). Keeping them means
+    // this preserve branch loses no data, and the parent still reads as dirty
+    // to the synthesis pass (its children were updated after `rolledUpAt`), so
+    // the next scheduled tick re-synthesises over the new children.
+    const existingMeta = (existingEntity?.metadata as Record<string, unknown> | undefined) ?? {};
+    const wasSynthesised = existingMeta.synthesizedBy === 'parent-description-synthesis';
+    const preserveSynthesisedDescription =
+      wasSynthesised &&
+      typeof source.description !== 'string' &&
+      typeof existingEntity?.description === 'string' &&
+      existingEntity.description.length > 0;
+
+    if (preserveSynthesisedDescription) {
+      description = existingEntity!.description as string;
+    }
+
     // One source for the level, so the `hierarchyLevel` stamp and the
     // `isScaffoldNode` derivation below can never disagree. sourceMetadata
     // wins over the loose `level` field, mirroring the stamps themselves.
@@ -580,6 +614,12 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
         // validated_file_path is rewritten by wave 4 on every run.
         ...((existingEntity?.metadata as Record<string, unknown> | undefined) ?? {}),
         ...sourceMetadata,
+        // See the preserve branch above: when a synthesised parent description
+        // is kept, the run's fresh observations would otherwise vanish with the
+        // join that was discarded. Stash them so the write stays lossless.
+        ...(preserveSynthesisedDescription && observationsJoined.length > 0
+          ? { observations: source.observations, observationsJoinedAt: now }
+          : {}),
         subsystem: 'wave-analysis',
         // Gap 4: prefer team from sourceMetadata when present (the
         // canonical-mapper Gap 1 stamp), else fall back to the options bag.
