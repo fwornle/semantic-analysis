@@ -1,5 +1,5 @@
 @startuml agent-coordination-flow
-!include /Users/q284340/Agentic/coding/docs/puml/_standard-style.puml
+!include _standard-style.puml
 
 title 14-Agent Coordination Flow
 
