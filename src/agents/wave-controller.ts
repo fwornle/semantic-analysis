@@ -43,6 +43,7 @@ import type {
   TraceQAResult,
   TraceCGRQuery,
 } from '../trace-types.js';
+import { listLslFiles, lslHistoryRoot } from '../utils/lsl-discovery.js';
 import { CgrQueryCache } from '../services/cgr-query-cache.js';
 import { CgrObservationBuilder } from '../utils/cgr-observation-builder.js';
 import { DocumentationLinkerAgent } from './documentation-linker-agent.js';
@@ -3326,18 +3327,14 @@ export class WaveController {
    * Get recent session files for BatchContext.
    */
   private getRecentSessions(days: number): Array<{ filename: string; timestamp: Date }> {
+    // Was a flat readdir filtered to '.md', which matched nothing once sessions
+    // moved into YYYY/MM tranches and became .jsonl — so BatchContext.sessions
+    // was [] on every run and the conv operator enriched nothing. See
+    // utils/lsl-discovery.ts for why that failed silently.
     try {
-      const sessionsDir = path.join(this.repositoryPath, '.specstory', 'history');
-      if (!fs.existsSync(sessionsDir)) return [];
-
-      const cutoff = Date.now() - days * 24 * 60 * 60 * 1000;
-      return fs.readdirSync(sessionsDir)
-        .filter(f => f.endsWith('.md'))
-        .map(f => {
-          const dateStr = f.substring(0, 10); // YYYY-MM-DD prefix
-          return { filename: f, timestamp: new Date(dateStr) };
-        })
-        .filter(s => s.timestamp.getTime() >= cutoff);
+      const since = new Date(Date.now() - days * 24 * 60 * 60 * 1000);
+      return listLslFiles(lslHistoryRoot(this.repositoryPath), { since })
+        .map(f => ({ filename: f.name, timestamp: f.date }));
     } catch {
       return [];
     }

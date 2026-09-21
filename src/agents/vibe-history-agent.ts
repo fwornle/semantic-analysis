@@ -1,6 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { log } from '../logging.js';
+import { listLslFiles } from '../utils/lsl-discovery.js';
 import { CheckpointManager } from '../utils/checkpoint-manager.js';
 import { SemanticAnalyzer } from './semantic-analyzer.js';
 
@@ -244,25 +245,13 @@ export class VibeHistoryAgent {
     const PARALLEL_BATCH_SIZE = 20; // Process 20 files in parallel
 
     try {
-      // Sort files by modification time descending to get most recent first
-      let files = fs.readdirSync(this.specstoryPath)
-        .filter(file => file.endsWith('.jsonl') || file.endsWith('.md'))
-        .map(file => ({
-          name: file,
-          path: path.join(this.specstoryPath, file),
-          mtime: fs.statSync(path.join(this.specstoryPath, file)).mtime
-        }))
-        .sort((a, b) => b.mtime.getTime() - a.mtime.getTime()); // Most recent first
-
-      // Filter by timestamp if provided
-      if (fromTimestamp) {
-        files = files.filter(f => f.mtime >= fromTimestamp);
-      }
-
-      // Apply maxSessions limit if provided and > 0
-      if (maxSessions && maxSessions > 0) {
-        files = files.slice(0, maxSessions);
-      }
+      // Newest first, ordered by the timestamp in the filename rather than
+      // mtime — a checkout or submodule update rewrites every mtime and would
+      // present months-old tranches as the most recent sessions.
+      const files = listLslFiles(this.specstoryPath, {
+        since: fromTimestamp,
+        max: maxSessions && maxSessions > 0 ? maxSessions : undefined,
+      });
 
       log(`Found ${files.length} session files to process (parallel batches of ${PARALLEL_BATCH_SIZE})`, 'info');
 
@@ -319,25 +308,13 @@ export class VibeHistoryAgent {
     const PARALLEL_BATCH_SIZE = 20;
 
     try {
-      // Get all session files and filter by date range
-      const allFiles = fs.readdirSync(this.specstoryPath)
-        .filter(file => file.endsWith('.jsonl') || file.endsWith('.md'))
-        .map(file => {
-          const filePath = path.join(this.specstoryPath, file);
-          const stats = fs.statSync(filePath);
-          // Extract date from filename for more accurate filtering
-          const dateFromFilename = this.extractDateFromFilename(file);
-          return {
-            name: file,
-            path: filePath,
-            date: dateFromFilename || stats.mtime
-          };
-        });
-
-      // Filter files within the date range
-      const files = allFiles.filter(f => {
-        return f.date >= startDate && f.date <= endDate;
-      }).sort((a, b) => a.date.getTime() - b.date.getTime()); // Oldest first
+      // Oldest first, bounded by the requested range. The filename carries the
+      // authoritative start instant, so no stat() is needed to date a session.
+      const files = listLslFiles(this.specstoryPath, {
+        since: startDate,
+        until: endDate,
+        order: 'oldest',
+      });
 
       log(`Found ${files.length} session files for date range`, 'info', {
         startDate: startDate.toISOString(),
