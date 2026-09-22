@@ -282,6 +282,9 @@ export class InsightGenerationAgent {
       // --- Code Evidence section (all entity levels L0-L3) ---
       const codeEvidenceSection = this.buildCodeEvidenceSection(params.observations);
 
+      // --- Work Record section (stage 3) — the other half of the evidence ---
+      const workRecordSection = this.buildWorkRecordSection(params.observations);
+
       // --- Diagram links section (only appends diagrams the LLM didn't embed inline) ---
       const diagramLinksSection = this.buildDiagramLinksSection(params.entityName, successfulDiagrams, content);
 
@@ -313,8 +316,10 @@ export class InsightGenerationAgent {
         }
       }
 
-      // Assemble sections: content -> code evidence -> diagrams -> hierarchy context
-      const appendedSections = codeEvidenceSection + diagramLinksSection + hierarchySection;
+      // Assemble sections: content -> code evidence -> work record -> diagrams
+      //                    -> hierarchy context
+      const appendedSections =
+        codeEvidenceSection + workRecordSection + diagramLinksSection + hierarchySection;
 
       // Insert appended sections before the footer (--- line)
       let finalContent: string;
@@ -2004,9 +2009,44 @@ Best practices, rules, and conventions for using this correctly. What should dev
   }
 
   /**
+   * Build a markdown section from the work-record evidence on an entity.
+   *
+   * Sibling of `buildCodeEvidenceSection`, deliberately SEPARATE rather than
+   * folded into it: `[SESSION]` observations are not code artifacts, and
+   * listing them under "Code Evidence" would assert a grounding they do not
+   * have. Without this they are simply dropped from the document — the entity
+   * would carry session-grounded knowledge that nothing ever renders.
+   *
+   * Returns '' when the entity has none, which is every entity in a project
+   * the recorder has never seen.
+   */
+  private buildWorkRecordSection(observations: string[]): string {
+    const sessionObservations = observations.filter(obs => obs.startsWith('[SESSION]'));
+    if (sessionObservations.length === 0) {
+      return '';
+    }
+
+    const cleaned = sessionObservations
+      .map(obs => obs.replace(/^\[SESSION(\+CGR)?\]\s*/, ''))
+      .slice(0, 15);
+
+    let section = '\n## Work Record\n\nWhat working sessions recorded about this entity — decisions taken, problems hit, and why things are the way they are:\n\n';
+    for (const item of cleaned) {
+      section += `- ${item}\n`;
+    }
+    if (sessionObservations.length > cleaned.length) {
+      section += `\n_(+${sessionObservations.length - cleaned.length} further session-grounded observations)_\n`;
+    }
+    return section;
+  }
+
+  /**
    * Build a markdown section with CGR code evidence extracted from observations.
    * Filters for [CGR] and [LLM+CGR] tagged observations, groups by type, caps at 15 items.
    * Returns empty string if no CGR observations found (applies to ALL entity levels L0-L3).
+   *
+   * `[SESSION]` observations are handled by `buildWorkRecordSection` instead —
+   * see there for why they are not merged in here.
    */
   private buildCodeEvidenceSection(observations: string[]): string {
     // Filter for CGR-tagged observations

@@ -200,8 +200,16 @@ export interface KmCoreAdapter {
     details: string;
   }>;
 
+  /**
+   * Bulk edge read, filtered by any subset of a Relation's fields.
+   *
+   * `{ type: 'contains' }` is the hierarchy-ancestry query
+   * `knowledge/session-facts.ts` uses to roll a node's session facts up to its
+   * ancestors. Unfiltered, this returns every edge in the store.
+   */
+  queryRelations(filter?: Partial<Relation>): Promise<Relation[]>;
+
   // Cold-path stubs — throw NotImplementedError. Fill in when a caller appears.
-  queryRelations(options?: Record<string, unknown>): Promise<never>;
   queryByOntologyClass(options?: Record<string, unknown>): Promise<never>;
   findRelated(entityName: string, depth?: number, filter?: unknown): Promise<never>;
 }
@@ -934,14 +942,23 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
   }
 
   // -------------------------------------------------------------------------
-  // Cold-path stubs — RESEARCH §3 closing recommendation
+  // queryRelations — bulk edge read
   // -------------------------------------------------------------------------
 
-  async function queryRelations(_options?: Record<string, unknown>): Promise<never> {
-    throw new Error(
-      'NotImplementedError: km-core-adapter.queryRelations — no callers in src/, fill in when needed',
-    );
+  /**
+   * Was a cold-path stub ("fill in when a caller appears"). The caller
+   * appeared: `knowledge/session-facts.ts` needs every `contains` edge at
+   * once to walk hierarchy ancestry.
+   *
+   * It is deliberately a BULK read rather than a loop over
+   * `queryIncomingRelations`. That one resolves a name and scans the whole
+   * edge set per call; asking it about each of ~2,500 entities would be ~2,500
+   * scans of ~17,000 edges to answer a question one scan already answers.
+   */
+  async function queryRelations(filter: Partial<Relation> = {}): Promise<Relation[]> {
+    return store.findRelations(filter);
   }
+
   async function queryByOntologyClass(_options?: Record<string, unknown>): Promise<never> {
     throw new Error(
       'NotImplementedError: km-core-adapter.queryByOntologyClass — no callers in src/, fill in when needed',

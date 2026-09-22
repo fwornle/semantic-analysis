@@ -23,6 +23,7 @@ import { toCanonicalEntity, augmentWithCanonical } from './canonical-mapper.js';
 import { createLLMWithProcess } from './llm-with-process.js';
 import { PROCESS_TAGS } from './process-tags.js';
 import { parseLlmJson } from '../utils/parse-llm-json.js';
+import { formatSessionFacts, preserveUnreproducibleEvidence } from '../knowledge/session-facts.js';
 
 // Phase 42.2 Plan 02 Gap 2 — process-tag for token-usage attribution.
 // Wave3 discover + observation-retry share this tag (forensics §2.1 row 6-7).
@@ -188,6 +189,11 @@ export class Wave3DetailAgent {
     // Phase: sem_observation_gen — enriching entities with deep observations
     if (onPhase) await onPhase('sem_observation_gen');
 
+    // Stage 3 — rendered once per execution, not per entity: every entity in
+    // this wave describes part of the same subtree, so they share the work
+    // record scoped to it.
+    const sessionBlock = formatSessionFacts(input.sessionFacts ?? []);
+
     // Enrich each L3 entity via CGR + SemanticAnalysisAgent (per-entity, fresh instance)
     if (!isMockLLMEnabled(this.repositoryPath)) {
       for (const entity of l3Entities) {
@@ -235,13 +241,15 @@ export class Wave3DetailAgent {
             parentContext: input.l2Entity.observations,
             analysisDepth: 'deep',
             cgrContext: cgrPrompt || undefined,
+            sessionContext: sessionBlock || undefined,
           };
           const analysisResult = await semanticAgent.analyzeEntityCode(analysisInput);
           // Auto-tag SAA observations based on CGR context presence
           const taggedObs = SemanticAnalysisAgent.autoTagObservations(analysisResult.observations, !!cgrPrompt);
-          // Preserve existing [CGR] observations, then set LLM observations
-          const existingCgrObs = entity.observations.filter(o => o.startsWith('[CGR]'));
-          entity.observations = [...existingCgrObs, ...taggedObs];
+          // Keep the evidence the SAA cannot regenerate ([CGR] from the code
+          // graph, [SESSION] from the work record), then set LLM observations.
+          const preservedEvidence = preserveUnreproducibleEvidence(entity.observations);
+          entity.observations = [...preservedEvidence, ...taggedObs];
           (entity as any)._analysisArtifacts = analysisResult.artifacts;
           // Carry the structured evidence-gap flag onto the entity so wave 4 can
           // refuse to write a document grounded in nothing. Prose saying "none of
@@ -334,6 +342,8 @@ export class Wave3DetailAgent {
       : '';
 
     const docSection = input.docContext ? `\n## Project Documentation\n${input.docContext}\n` : '';
+    // Stage 3 — session facts anchored on this sub-component or below it.
+    const sessionSection = formatSessionFacts(input.sessionFacts ?? []);
 
     const prompt = `You are analyzing the ${input.l2Entity.name} sub-component to identify its detail-level knowledge nodes.
 
@@ -344,7 +354,7 @@ SubComponent (L2): ${input.l2Entity.name} - ${l2Description}
 
 ## Source Files
 ${fileSection}
-${suggestedSection}${docSection}
+${suggestedSection}${docSection}${sessionSection}
 ## Task
 Identify ${hasFiles ? '2-5' : '1-2'} Detail-level (L3) nodes that represent specific, notable aspects of this sub-component.
 

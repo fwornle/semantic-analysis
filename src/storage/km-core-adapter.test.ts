@@ -145,16 +145,13 @@ describe('km-core-adapter — surface', () => {
     }
   });
 
-  it('surface — Test 5: cold-path methods throw NotImplementedError', async () => {
+  it('surface — Test 5: the remaining cold-path methods throw NotImplementedError', async () => {
     const store = new StubGraphKMStore();
     // eslint-disable-next-line @typescript-eslint/no-explicit-any
     const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
 
-    await assert.rejects(
-      // eslint-disable-next-line @typescript-eslint/no-explicit-any
-      (adapter as any).queryRelations({}),
-      /NotImplementedError: km-core-adapter\.queryRelations/,
-    );
+    // `queryRelations` left this list in stage 3 — see Test 5b. The other two
+    // are still stubs, and this asserts they did not quietly follow it.
     await assert.rejects(
       // eslint-disable-next-line @typescript-eslint/no-explicit-any
       (adapter as any).queryByOntologyClass({}),
@@ -165,6 +162,46 @@ describe('km-core-adapter — surface', () => {
       (adapter as any).findRelated('foo', 1),
       /NotImplementedError: km-core-adapter\.findRelated/,
     );
+  });
+
+  it('surface — Test 5b: queryRelations is implemented and delegates to store.findRelations', async () => {
+    // Stage 3 — `knowledge/session-facts.ts` needs every `contains` edge in one
+    // read to walk hierarchy ancestry. It is a BULK read on purpose: looping
+    // `queryIncomingRelations` over ~2,500 entities would scan ~17,000 edges
+    // each time to answer what one scan answers.
+    const calls: Array<Record<string, unknown>> = [];
+    const store = new StubGraphKMStore();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (store as any).findRelations = async (filter: Record<string, unknown>) => {
+      calls.push(filter);
+      return [{ type: 'contains', from: 'parent-id', to: 'child-id' }];
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const rels = await (adapter as any).queryRelations({ type: 'contains' });
+
+    assert.deepEqual(calls, [{ type: 'contains' }], 'the filter must reach the store unchanged');
+    assert.equal(rels.length, 1);
+    assert.equal(rels[0].type, 'contains');
+  });
+
+  it('surface — Test 5c: an omitted filter reads every edge rather than none', async () => {
+    const calls: Array<Record<string, unknown>> = [];
+    const store = new StubGraphKMStore();
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    (store as any).findRelations = async (filter: Record<string, unknown>) => {
+      calls.push(filter);
+      return [];
+    };
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    const adapter = createKmCoreAdapter({ store: store as any, team: 'coding' });
+
+    // eslint-disable-next-line @typescript-eslint/no-explicit-any
+    await (adapter as any).queryRelations();
+
+    assert.deepEqual(calls, [{}], 'undefined must become an empty filter, not be forwarded as undefined');
   });
 });
 

@@ -25,6 +25,7 @@ import { toCanonicalEntity, augmentWithCanonical } from './canonical-mapper.js';
 import { createLLMWithProcess } from './llm-with-process.js';
 import { PROCESS_TAGS } from './process-tags.js';
 import { parseLlmJson } from '../utils/parse-llm-json.js';
+import { formatSessionFacts, preserveUnreproducibleEvidence } from '../knowledge/session-facts.js';
 
 // Phase 42.2 Plan 02 Gap 2 — process-tag for token-usage attribution.
 // Wave2 analyze + observation-retry share this tag (forensics §2.1 row 4-5).
@@ -220,6 +221,11 @@ export class Wave2ComponentAgent {
     // Phase: sem_observation_gen — enriching entities with deep observations
     if (onPhase) await onPhase('sem_observation_gen');
 
+    // Stage 3 — rendered once per execution, not per entity: every entity in
+    // this wave describes part of the same subtree, so they share the work
+    // record scoped to it.
+    const sessionBlock = formatSessionFacts(input.sessionFacts ?? []);
+
     // Enrich each L2 entity via CGR + SemanticAnalysisAgent (per-entity, fresh instance)
     if (!isMockLLMEnabled(this.repositoryPath)) {
       for (const entity of l2Entities) {
@@ -257,13 +263,15 @@ export class Wave2ComponentAgent {
             parentContext: input.l1Entity.observations,
             analysisDepth: 'deep',
             cgrContext: cgrPrompt || undefined,
+            sessionContext: sessionBlock || undefined,
           };
           const analysisResult = await semanticAgent.analyzeEntityCode(analysisInput);
           // Auto-tag SAA observations based on CGR context presence
           const taggedObs = SemanticAnalysisAgent.autoTagObservations(analysisResult.observations, !!cgrPrompt);
-          // Preserve existing [CGR] observations, then set LLM observations
-          const existingCgrObs = entity.observations.filter(o => o.startsWith('[CGR]'));
-          entity.observations = [...existingCgrObs, ...taggedObs];
+          // Keep the evidence the SAA cannot regenerate ([CGR] from the code
+          // graph, [SESSION] from the work record), then set LLM observations.
+          const preservedEvidence = preserveUnreproducibleEvidence(entity.observations);
+          entity.observations = [...preservedEvidence, ...taggedObs];
           (entity as any)._analysisArtifacts = analysisResult.artifacts;
           // Carry the structured evidence-gap flag onto the entity so wave 4 can
           // refuse to write a document grounded in nothing. Prose saying "none of
@@ -342,6 +350,10 @@ export class Wave2ComponentAgent {
       : `Component ${input.l1Entity.name}`;
 
     const docSection = input.docContext ? `\n## Project Documentation\n${input.docContext}\n` : '';
+    // Stage 3 — the recorder's half of the picture. '' when the store holds
+    // nothing for this component, so the prompt is byte-identical to the
+    // pre-stage-3 one rather than carrying an empty heading to fill.
+    const sessionSection = formatSessionFacts(input.sessionFacts ?? []);
 
     const prompt = `You are analyzing the ${input.l1Entity.name} component to identify its sub-components (L2 nodes).
 
@@ -354,7 +366,7 @@ ${manifestList || '(none defined)'}
 
 ## Source Files
 ${fileContents || '(no source files available)'}
-${docSection}
+${docSection}${sessionSection}
 
 ## Task
 1. For each known sub-component, provide 5-7 specific observations. Each observation MUST:

@@ -22,6 +22,7 @@ import type { DiscoveredManifestEntry } from '../types/component-manifest.js';
 // Phase 42.2 Plan 04 — legacy GraphDatabaseAdapter retired.
 // All persistence (read + write) routes through the km-core adapter.
 import { createKmCoreAdapter, type KmCoreAdapter } from '../storage/km-core-adapter.js';
+import { buildSessionFactIndex, type SessionFactIndex } from '../knowledge/session-facts.js';
 // Phase 42 Plan 07 Phase B1 — KM_CORE_PERSISTENCE feature flag REMOVED.
 // km-core is now the unconditional persistence backend. Legacy graphDB writes
 // (operator-bypass + per-wave persistEntities) have been deleted.
@@ -96,6 +97,13 @@ export class WaveController {
    * retired). Bootstrapped in execute() before any wave runs.
    */
   private kmCoreAdapter?: KmCoreAdapter;
+  /**
+   * Stage 3 — the online recorder's Insights, indexed by the hierarchy node
+   * they were placed under. Undefined until the run builds it, and left
+   * undefined when the store cannot answer: session facts enrich a wave, they
+   * do not gate it.
+   */
+  private sessionFacts?: SessionFactIndex;
   /** Caller-owned km-core store, when running in the owner's process. */
   private injectedKmStore?: object;
   private reportAgent: WorkflowReportAgent;
@@ -628,6 +636,17 @@ export class WaveController {
         count: existingEntities.length,
         seededNames: this.persistedEntityNames.size,
       });
+
+      // ---- Stage 3: the recorder's output becomes a wave input -------------
+      // Built ONCE per run, not per agent: it is two bulk reads over the whole
+      // store, and wave 2 alone spawns one agent per component.
+      //
+      // The waves are NOT re-reading .specstory here. The recorder already
+      // distilled those sessions into Insights, redacted and placed under a
+      // hierarchy node by stage 2; this reads that output. Re-reading raw
+      // transcripts inside a wave would duplicate the recorder and re-import
+      // the PII problem the redactor exists to solve.
+      this.sessionFacts = await this.buildSessionFacts();
 
       // Start workflow report for history
       const executionId = `wave-analysis-${new Date().toISOString().replace(/[:.]/g, '-')}`;
@@ -1730,6 +1749,9 @@ export class WaveController {
         existingEntities,
         repositoryPath: this.repositoryPath,
         docContext: this.formatDocContext(),
+        // Wave 1 describes every component in one execution, so it scopes the
+        // facts itself as it loops (see Wave1Input.sessionFactsFor).
+        sessionFactsFor: (name: string) => this.sessionFacts?.subtreeForName(name) ?? [],
         onPhase: async (phase: string) => {
           dispatch({ type: 'substep-update', substepId: phase });
           await this.checkSingleStepPause(phase, true);
@@ -1816,6 +1838,9 @@ export class WaveController {
             componentKeywords,
             manifestChildren: childEntries,
             docContext: this.formatDocContext(),
+            // Subtree, not direct: what was recorded about this component's
+            // sub-components is evidence about the component.
+            sessionFacts: this.sessionFacts?.subtreeForName(l1Entity.name) ?? [],
             onPhase: async (phase: string) => {
               // Only one entity pauses per phase — others skip to avoid N×duplicate pauses
               if (phaseLockHolder === null || phaseLockHolder === l1Entity.name) {
@@ -1971,6 +1996,7 @@ export class WaveController {
             scopedFiles,
             suggestedChildren,
             docContext: this.formatDocContext(),
+            sessionFacts: this.sessionFacts?.subtreeForName(l2Entity.name) ?? [],
             onPhase: async (phase: string) => {
               // Only one entity pauses per phase — others skip to avoid N×duplicate pauses
               if (phaseLockHolder === null || phaseLockHolder === l2Entity.name) {
@@ -3561,6 +3587,53 @@ export class WaveController {
         error: error instanceof Error ? error.message : String(error),
       });
       return [];
+    }
+  }
+
+  /**
+   * Build the session-fact index for this run.
+   *
+   * Returns undefined rather than throwing when the adapter is missing or the
+   * read fails. A wave-analysis that cannot reach the recorder's output must
+   * still describe the code — the failure mode to avoid is a run that dies
+   * because an ENRICHMENT was unavailable.
+   *
+   * The counters are logged because the useful diagnostic is not "did it
+   * work" but "how much did it find": `insightsWithOwner` far below
+   * `insightsSeen` means stage 2's placement is regressing, and a non-zero
+   * `danglingAnchors` means placement is writing ids that a later merge
+   * invalidates. Both are invisible in a plain success/failure line.
+   */
+  private async buildSessionFacts(): Promise<SessionFactIndex | undefined> {
+    if (!this.kmCoreAdapter) {
+      log('[WaveController] km-core adapter absent; waves run without session facts', 'warning');
+      return undefined;
+    }
+    try {
+      const index = await buildSessionFactIndex(this.kmCoreAdapter);
+      const s = index.stats;
+      log('[WaveController] Session facts indexed', 'info', {
+        insightsSeen: s.insightsSeen,
+        insightsWithOwner: s.insightsWithOwner,
+        factsIndexed: s.factsIndexed,
+        anchoredNodes: s.anchoredNodes,
+        danglingAnchors: s.danglingAnchors,
+      });
+      if (s.insightsSeen > 0 && s.factsIndexed === 0) {
+        // The store holds Insights and not one of them reached a wave. That is
+        // the stage-1 failure shape all over again — a silent empty input that
+        // every downstream measurement is then taken against.
+        log('[WaveController] Insights exist but none are placed — waves get no session input', 'warning', {
+          insightsSeen: s.insightsSeen,
+          danglingAnchors: s.danglingAnchors,
+        });
+      }
+      return index;
+    } catch (error) {
+      log('[WaveController] Session-fact index failed; waves run without session facts', 'warning', {
+        error: error instanceof Error ? error.message : String(error),
+      });
+      return undefined;
     }
   }
 
