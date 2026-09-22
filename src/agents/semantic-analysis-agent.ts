@@ -1965,14 +1965,23 @@ Extract and respond with JSON:
       ? `\nIf <code_graph> data is provided above, reference it in your observations. Prefix observations grounded in code graph data with [LLM+CGR]. Prefix observations from your own analysis with [LLM].`
       : '';
 
+    // Stage 3 — the work record. Already rendered by `formatSessionFacts`,
+    // which carries its own [SESSION] tagging instruction, so there is no
+    // second instruction string to keep in sync here.
+    const sessionBlock = input.sessionContext || '';
+
+    const sessionInstructions = input.sessionContext
+      ? `\nThe work record above is evidence too. An observation that rests on it — what broke, what was decided, why something is the way it is — is worth more than a restatement of the file listing, and MUST be prefixed [SESSION] (or [SESSION+CGR] when the code graph confirms it).`
+      : '';
+
     const prompt = `You are analyzing the "${input.entityName}" component (type: ${input.entityType}) of a software project.
-${parentContextBlock}${cgrBlock}
+${parentContextBlock}${cgrBlock}${sessionBlock}
 ## Code Files
 ${codeBlock}
 
 ## Instructions
 Analyze this code component and produce a JSON response with:
-1. "observations" - An array of 5+ detailed multi-paragraph observations about architecture, patterns, trade-offs, and implementation details. Each observation MUST reference specific files/functions. AVOID generic statements.${cgrInstructions}
+1. "observations" - An array of 5+ detailed multi-paragraph observations about architecture, patterns, trade-offs, and implementation details. Each observation MUST reference specific files/functions. AVOID generic statements.${cgrInstructions}${sessionInstructions}
 2. "patterns" - An array of architectural patterns discovered (e.g. "Observer pattern for event handling", "Repository pattern for data access")
 3. "architectureNotes" - An array of architecture observations (e.g. "Uses dependency injection via constructor", "Tight coupling between X and Y")
 4. "codeReferences" - An array of specific file/line references grounding the analysis (e.g. "src/auth.ts:45 - JWT validation")
@@ -2107,7 +2116,12 @@ Respond ONLY with a JSON object. Do not include markdown fences or any text outs
   }
 
   static autoTagObservations(observations: readonly unknown[], hadCgrContext: boolean): string[] {
-    const tagPattern = /^\[(CGR|LLM|LLM\+CGR)\]/;
+    // [SESSION] joins the set in stage 3: an observation resting on the work
+    // record rather than on the source files. It MUST be recognised here — an
+    // unrecognised prefix is not left alone, it is prefixed again, and the
+    // corpus would fill with `[LLM] [SESSION] …` strings whose provenance
+    // reads as the opposite of what it is.
+    const tagPattern = /^\[(CGR|LLM|LLM\+CGR|SESSION|SESSION\+CGR)\]/;
     const codeRefPattern = /[A-Z][a-z]+[A-Z]|\.(ts|js|py|yaml|json)\b|\/[\w-]+\//;
 
     return observations

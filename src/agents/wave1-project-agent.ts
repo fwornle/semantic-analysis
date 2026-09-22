@@ -31,6 +31,7 @@ import { toCanonicalEntity, augmentWithCanonical } from './canonical-mapper.js';
 import { createLLMWithProcess } from './llm-with-process.js';
 import { PROCESS_TAGS } from './process-tags.js';
 import { parseLlmJson } from '../utils/parse-llm-json.js';
+import { formatSessionFacts, preserveUnreproducibleEvidence, type SessionFact } from '../knowledge/session-facts.js';
 
 // Phase 42.2 Plan 02 Gap 2 — process-tag for token-usage attribution.
 // Wave1 enrich + analyze + observation-retry all share this tag (forensics
@@ -172,6 +173,10 @@ export class Wave1ProjectAgent {
           existingEntitiesContext,
           fileContents,
           input.docContext,
+          // Stage 3 — scope the work record to THIS component. The lookup
+          // rolls up descendants, so a component's facts include everything
+          // recorded about its sub-components and details.
+          input.sessionFactsFor?.(component.name) ?? [],
         );
       }
 
@@ -250,13 +255,17 @@ export class Wave1ProjectAgent {
           const docSection = input.docContext
             ? `\n## Project Documentation\n${input.docContext}\n`
             : '';
+          // Stage 3 — the same work record this component's first-pass analysis
+          // saw. This pass REPLACES the observations, so without it the enrich
+          // step would quietly undo the session grounding.
+          const sessionSection = formatSessionFacts(input.sessionFactsFor?.(l1Entity.name) ?? []);
 
           const enrichPrompt = `You are performing deep observation synthesis for the "${l1Entity.name}" component of the Coding project.
 
 ## Component Context
 Name: ${l1Entity.name}
 Hierarchy: ${input.manifest.project.name}/${l1Entity.name}
-${cgrSection}${docSection}
+${cgrSection}${docSection}${sessionSection}
 ## Initial Analysis
 ${l1Entity.observations.join('\n')}
 
@@ -311,9 +320,11 @@ IMPORTANT: Return ONLY the JSON object, no markdown code blocks.`;
           if (enrichedObs.length > 0) {
             // Auto-tag LLM observations based on CGR context presence
             const taggedObs = SemanticAnalysisAgent.autoTagObservations(enrichedObs, !!entityCgrContext);
-            // Preserve any existing [CGR] observations, then replace LLM observations
-            const existingCgrObs = l1Entity.observations.filter(o => o.startsWith('[CGR]'));
-            l1Entity.observations = [...existingCgrObs, ...taggedObs];
+            // Keep the evidence this pass cannot regenerate ([CGR] from the
+            // code graph, [SESSION] from the work record), then replace the
+            // LLM observations.
+            const preservedEvidence = preserveUnreproducibleEvidence(l1Entity.observations);
+            l1Entity.observations = [...preservedEvidence, ...taggedObs];
             log(`[Wave1] Enriched entity ${l1Entity.name} with multi-step analysis (${taggedObs.length} observations, CGR context: ${!!entityCgrContext})`, 'info');
           }
 
@@ -404,12 +415,16 @@ IMPORTANT: Return ONLY the JSON object, no markdown code blocks.`;
     existingEntitiesContext: string,
     representativeFiles: string[],
     docContext?: string,
+    sessionFacts: SessionFact[] = [],
   ): Promise<ComponentAnalysis> {
     const fileContentsBlock = representativeFiles.length > 0
       ? representativeFiles.join('\n\n---\n\n')
       : '(No representative files found)';
 
     const docSection = docContext ? `\n## Project Documentation\n${docContext}\n` : '';
+    // Stage 3 — '' when the recorder has nothing for this component, keeping
+    // the prompt byte-identical to the pre-stage-3 one.
+    const sessionSection = formatSessionFacts(sessionFacts);
 
     const prompt = `You are analyzing the ${component.name} component of the Coding project.
 
@@ -426,7 +441,7 @@ Keywords: ${component.keywords.join(', ')}
 
 ## Source Files
 ${fileContentsBlock}
-
+${sessionSection}
 ## Task
 1. Write a comprehensive summary (2-3 paragraphs) of what this component does, its architecture, and key patterns.
 

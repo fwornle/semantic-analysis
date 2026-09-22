@@ -12,6 +12,7 @@
 
 import type { KGEntity, KGRelation } from '../agents/kg-operators.js';
 import type { ComponentManifest } from './component-manifest.js';
+import type { SessionFact } from '../knowledge/session-facts.js';
 
 // ============================================================================
 // Analysis Artifact & Trace Data Contracts
@@ -87,6 +88,15 @@ export interface AnalyzeEntityCodeInput {
   analysisDepth: 'deep';
   /** CGR context data injected as a separate parameter (not merged into parentContext) */
   cgrContext?: string;
+  /**
+   * Stage 3 — pre-rendered session-fact block (see `formatSessionFacts`).
+   *
+   * This pass OVERWRITES the entity's observations, so if it cannot see the
+   * work record, the session-grounded observations produced by the wave's
+   * first LLM call are replaced by code-only ones and stage 3's whole effect
+   * is erased at the last step.
+   */
+  sessionContext?: string;
 }
 
 /**
@@ -282,6 +292,19 @@ export interface Wave1Input {
   existingEntities: KGEntity[];
   /** Absolute path to the repository being analyzed */
   repositoryPath: string;
+  /**
+   * Session-derived facts, looked up per component.
+   *
+   * A FUNCTION rather than an array because wave 1 is the only wave that
+   * describes many nodes in one execution — it loops over every component in
+   * the manifest, so it must scope the facts itself. Waves 2 and 3 each
+   * describe one subtree and take a pre-scoped `sessionFacts` array.
+   *
+   * Optional because a wave must still run when the store holds none (a fresh
+   * checkout, or a project the recorder has never seen). Absent facts mean the
+   * agent produces exactly what it produced before session input existed.
+   */
+  sessionFactsFor?: (componentName: string) => SessionFact[];
   /** Optional documentation context from DocumentationLinkerAgent (injected into LLM prompts) */
   docContext?: string;
   /** Optional callback invoked at each semantic phase transition (for single-step pause support) */
@@ -301,6 +324,16 @@ export interface Wave2Input {
   componentKeywords: string[];
   /** Pre-defined L2 children from the component manifest (may be extended by discovery) */
   manifestChildren: ChildManifestEntry[];
+  /**
+   * Session-derived facts for the node this agent is describing — Insights the
+   * online recorder distilled from real working sessions, scoped by the
+   * hierarchy placement stage 2 gave them.
+   *
+   * Optional because a wave must still run when the store holds none (a fresh
+   * checkout, or a project the recorder has never seen). Absent facts mean the
+   * agent produces exactly what it produced before session input existed.
+   */
+  sessionFacts?: SessionFact[];
   /** Optional documentation context from DocumentationLinkerAgent (injected into LLM prompts) */
   docContext?: string;
   /** Optional callback invoked at each semantic phase transition (for single-step pause support) */
@@ -320,6 +353,16 @@ export interface Wave3Input {
   scopedFiles: string[];
   /** L3 children suggested by Wave 2 agent -- used as discovery seeds, not authoritative */
   suggestedChildren?: ChildManifestEntry[];
+  /**
+   * Session-derived facts for the node this agent is describing — Insights the
+   * online recorder distilled from real working sessions, scoped by the
+   * hierarchy placement stage 2 gave them.
+   *
+   * Optional because a wave must still run when the store holds none (a fresh
+   * checkout, or a project the recorder has never seen). Absent facts mean the
+   * agent produces exactly what it produced before session input existed.
+   */
+  sessionFacts?: SessionFact[];
   /** Optional documentation context from DocumentationLinkerAgent (injected into LLM prompts) */
   docContext?: string;
   /** Optional callback invoked at each semantic phase transition (for single-step pause support) */
