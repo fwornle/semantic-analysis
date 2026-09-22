@@ -1970,9 +1970,10 @@ Extract and respond with JSON:
     // second instruction string to keep in sync here.
     const sessionBlock = input.sessionContext || '';
 
-    const sessionInstructions = input.sessionContext
-      ? `\nThe work record above is evidence too. An observation that rests on it — what broke, what was decided, why something is the way it is — is worth more than a restatement of the file listing, and MUST be prefixed [SESSION] (or [SESSION+CGR] when the code graph confirms it).`
-      : '';
+    // No separate instruction string for the session block: `formatSessionFacts`
+    // carries its own rules (floor, ceiling, tagging, style). A second copy
+    // here is how two versions of the same rule drift apart — and the weaker
+    // one wins whichever way the model resolves the conflict.
 
     const prompt = `You are analyzing the "${input.entityName}" component (type: ${input.entityType}) of a software project.
 ${parentContextBlock}${cgrBlock}${sessionBlock}
@@ -1981,7 +1982,7 @@ ${codeBlock}
 
 ## Instructions
 Analyze this code component and produce a JSON response with:
-1. "observations" - An array of 5+ detailed multi-paragraph observations about architecture, patterns, trade-offs, and implementation details. Each observation MUST reference specific files/functions. AVOID generic statements.${cgrInstructions}${sessionInstructions}
+1. "observations" - An array of 5+ detailed multi-paragraph observations about architecture, patterns, trade-offs, and implementation details. Each observation MUST reference specific files/functions. AVOID generic statements — except a [SESSION] observation, which names its work record instead (see "How to use the work record" above, when present).${cgrInstructions}
 2. "patterns" - An array of architectural patterns discovered (e.g. "Observer pattern for event handling", "Repository pattern for data access")
 3. "architectureNotes" - An array of architecture observations (e.g. "Uses dependency injection via constructor", "Tight coupling between X and Y")
 4. "codeReferences" - An array of specific file/line references grounding the analysis (e.g. "src/auth.ts:45 - JWT validation")

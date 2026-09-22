@@ -386,7 +386,7 @@ For each L3 node, provide:
 - name: PascalCase, specific and descriptive
 - description: 1-2 sentences about what it does
 - observations: 3-5 specific observations about architecture, behavior, or design decisions. Each observation MUST:
-  - Reference at least one specific code artifact (file path, class name, function name, or module) FROM THE SOURCE FILES ABOVE
+  - Reference at least one specific code artifact (file path, class name, function name, or module) FROM THE SOURCE FILES ABOVE (a [SESSION] observation names its work record instead — see "How to use the work record" above, when that section is present)
   - Describe a concrete architectural decision, behavior, or pattern
   - Be self-contained (understandable without reading the source)
 
@@ -397,6 +397,7 @@ For each L3 node, provide:
   BAD observations (DO NOT write these):
   - "Works well" (trivially generic, no code reference)
   - "Important implementation detail" (vague, no artifact mentioned)
+  - "This implies the retry path may be untested" (reacting to evidence instead of stating what it establishes)
   - References to files not shown in the Source Files section above
 
 ## Self-Sufficiency Standard
