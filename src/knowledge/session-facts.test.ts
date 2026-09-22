@@ -386,3 +386,78 @@ describe('session grounding survives the re-analysis pass', () => {
     assert.equal(tagged[0], '[LLM] plain claim');
   });
 });
+
+// ---------------------------------------------------------------------------
+// Prompt calibration — why grounding was 0 on one component and 14 on another
+// ---------------------------------------------------------------------------
+
+describe('formatSessionFacts — balance rules', () => {
+  function withFacts(n: number) {
+    const entities: AnyEntity[] = [entity('sub', 'Target', 'SubComponent')];
+    for (let i = 0; i < n; i += 1) {
+      entities.push(insight(`i${i}`, `Finding ${i}`, 'sub', `claim ${i}`));
+    }
+    return source(entities);
+  }
+
+  it('Test 20: the block resolves the code-artifact contradiction explicitly', async () => {
+    // Every wave prompt carries "each observation MUST reference a code
+    // artifact". A session fact satisfies that rule in no way at all, so the
+    // two instructions fought and each model settled it differently per
+    // component — 0 session observations on ConstraintSystem, 14 (and no code
+    // observations at all) on CodingPatterns. The block must say which rule
+    // governs a session-grounded observation.
+    const index = await buildSessionFactIndex(withFacts(5));
+    const block = formatSessionFacts(index.directFor('sub'));
+
+    assert.match(block, /MUST name the record it comes from/);
+    assert.match(block, /applies to\s+observations about the CODE/);
+  });
+
+  it('Test 21: a floor of 2 applies once there are enough records to meet it', async () => {
+    const index = await buildSessionFactIndex(withFacts(5));
+    const block = formatSessionFacts(index.directFor('sub'));
+
+    assert.match(block, /AT LEAST 2 of your observations must be grounded/);
+  });
+
+  it('Test 22: the floor drops to 1 when only one or two records exist', async () => {
+    // Asking for two session-grounded observations from a component with one
+    // record on file is an instruction that can only be met by inventing the
+    // second.
+    for (const n of [1, 2]) {
+      const index = await buildSessionFactIndex(withFacts(n));
+      const block = formatSessionFacts(index.directFor('sub'));
+      assert.match(block, /AT LEAST 1 of your observations must be grounded/, `n=${n}`);
+    }
+  });
+
+  it('Test 23: the floor follows what is SHOWN, not what exists', async () => {
+    // With 20 facts but a limit of 2, only 2 reach the model. The floor must
+    // be computed against the visible list or it demands grounding in records
+    // the model was never given.
+    const index = await buildSessionFactIndex(withFacts(20));
+    const block = formatSessionFacts(index.directFor('sub'), 2);
+
+    assert.match(block, /AT LEAST 1 of your observations must be grounded/);
+  });
+
+  it('Test 24: a ceiling keeps the code the primary subject', async () => {
+    const index = await buildSessionFactIndex(withFacts(5));
+    const block = formatSessionFacts(index.directFor('sub'));
+
+    assert.match(block, /NO MORE THAN HALF of your observations may be session-grounded/);
+    assert.match(block, /return fewer observations rather than/,
+      'thin source files must not be padded from the work record');
+  });
+
+  it('Test 25: the block bans reacting to evidence instead of stating it', async () => {
+    // Several wave-1 observations read "This suggests that…" / "This indicates
+    // that…" — the model narrating its own inference rather than recording
+    // what the session established.
+    const index = await buildSessionFactIndex(withFacts(5));
+    const block = formatSessionFacts(index.directFor('sub'));
+
+    assert.match(block, /do NOT write "This suggests/);
+  });
+});

@@ -370,7 +370,7 @@ ${docSection}${sessionSection}
 
 ## Task
 1. For each known sub-component, provide 5-7 specific observations. Each observation MUST:
-   - Reference at least one specific code artifact (file path, class name, function name, or module)
+   - Reference at least one specific code artifact (file path, class name, function name, or module) (a [SESSION] observation names its work record instead — see "How to use the work record" above, when that section is present)
    - Describe a concrete architectural decision, behavior, or pattern
    - Be self-contained (understandable without reading the source)
 
@@ -383,11 +383,12 @@ ${docSection}${sessionSection}
    - "Processes data" (too generic, no code reference)
    - "Is responsible for handling logic" (vague, no artifact)
    - "Works with other components" (meaningless boilerplate)
+   - "This indicates the module may handle retries" (reacting to evidence instead of stating what it establishes)
 
 ANTI-HALLUCINATION RULES:
 - Every sub-component you identify MUST correspond to actual code in the Source Files above
 - DO NOT invent sub-components, classes, or modules not visible in the source code
-- Each observation MUST reference specific files, classes, or functions FROM the Source Files section
+- Each observation MUST reference specific files, classes, or functions FROM the Source Files section (a [SESSION] observation names its work record instead — see "How to use the work record" above, when that section is present)
 - If source files are empty or insufficient, return fewer sub-components rather than speculating
 - DO NOT reference file paths or code artifacts not shown in the Source Files section
 

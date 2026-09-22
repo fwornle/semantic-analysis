@@ -446,7 +446,7 @@ ${sessionSection}
 1. Write a comprehensive summary (2-3 paragraphs) of what this component does, its architecture, and key patterns.
 
 2. List 5-7 specific observations about this component. Each observation MUST:
-   - Reference at least one specific code artifact (file path, class name, function name, or module)
+   - Reference at least one specific code artifact (file path, class name, function name, or module) (a [SESSION] observation names its work record instead — see "How to use the work record" above, when that section is present)
    - Describe a concrete architectural decision, behavior, or pattern
    - Be self-contained (understandable without reading the source)
 
@@ -459,11 +459,12 @@ ${sessionSection}
    - "Handles data storage" (too generic, no code reference)
    - "Is an important component" (no specifics, no artifact reference)
    - "Processes data efficiently" (vague, no code artifact mentioned)
+   - "This suggests the component may have concurrency issues" (reacting to evidence instead of stating what it establishes)
 
 ANTI-HALLUCINATION RULES:
 - Every component you identify MUST correspond to actual directories, modules, or systems visible in the repository
 - DO NOT invent components that you cannot point to in the codebase
-- Each observation MUST reference specific files, directories, or configuration artifacts
+- Each observation MUST reference specific files, directories, or configuration artifacts (a [SESSION] observation names its work record instead — see "How to use the work record" above, when that section is present)
 - If you are uncertain whether a component exists, DO NOT include it
 - It is better to return fewer accurate components than many speculative ones
 

@@ -266,13 +266,38 @@ export function formatSessionFacts(facts: readonly SessionFact[], limit = 12): s
     facts.length > shown.length
       ? `\n(+${facts.length - shown.length} further session records not shown)`
       : '';
+
+  // The floor scales with what was actually supplied: demanding two
+  // session-grounded observations from a component with one record on file
+  // is an instruction that can only be met by inventing the second.
+  const floor = shown.length >= 3 ? 2 : 1;
+
   return `
 ## What the work record says
 These are facts the online recorder distilled from actual working sessions —
 what was built, what broke, and what was decided. They are evidence about this
-area of the system, NOT source code. When an observation rests on one of these
-rather than on the source files, prefix it with [SESSION] instead of [LLM].
+area of the system, NOT source code.
 ${lines.join('\n')}${more}
+
+### How to use the work record
+The rule that every observation must cite a code artifact applies to
+observations about the CODE. These records are a second, independent kind of
+evidence, and an observation grounded in one is held to a different standard:
+it MUST name the record it comes from, and it MUST be prefixed [SESSION]
+(or [SESSION+CGR] when the code graph confirms it). That naming IS its
+grounding, exactly as a file path is the grounding of a code observation.
+
+- AT LEAST ${floor} of your observations must be grounded in these records.
+  They describe decisions, failures and constraints that CANNOT be recovered by
+  reading the source — a component described without them is a file listing.
+- NO MORE THAN HALF of your observations may be session-grounded. The code
+  remains the primary subject; the work record explains it, it does not replace
+  it. If the source files are thin, return fewer observations rather than
+  filling the gap from the records.
+- State what the record establishes, not your reaction to it. Write "tmux 3.6a
+  has no MouseMove event, so the status line substitutes click feedback for
+  hover"; do NOT write "This suggests that the status line may have hover
+  limitations."
 `;
 }
 
