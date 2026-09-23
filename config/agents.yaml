@@ -2,15 +2,32 @@
 # Used by: Coordinator, Dashboard, PlantUML Generator
 # Version: 1.1 - Added tier annotations and batch processing agents
 
-# Model Tiers:
-# - fast: Quick operations, lower cost (Groq llama-3.1-8b-instant, GPT-4o-mini)
-# - standard: Balanced quality/cost (Groq llama-3.3-70b-versatile, Claude Haiku)
-# - premium: High quality, higher cost (Claude Sonnet, GPT-4o)
+# Model Tiers — these are COMPLEXITY BANDS, not providers.
+# - fast:     quick operations        -> band `small`
+# - standard: balanced quality/cost   -> band `medium`
+# - premium:  high quality            -> band `high`
+#
+# WHICH PROVIDER AND MODEL SERVES A BAND IS NOT DECIDED HERE. It is decided by
+# rapid-llm-proxy at call time from `config/llm-routing.yaml`, per `bg-<process>`
+# route, and it changes without this file knowing. Ask the proxy, never this file:
+#   curl -s 'localhost:12435/api/llm/routing/resolve?job=bg-<process>' | jq -r .summary
+#
+# This block used to name models against each tier ("standard: Groq
+# llama-3.3-70b-versatile"), and `llmModel:` below repeated the same string for
+# ten agents. The dashboard printed it verbatim, so the UKB monitor advertised
+# `Groq: llama-3.3-70b-versatile` for work Claude on gh-copilot had performed —
+# groq served 0 of 1,589 calls in the 24h measured on 2026-09-23, and does not
+# enter a background route's chain until two accounts ahead of it have failed.
+#
+# So `llmModel` is null for every routed agent. Null means "ask the router"; the
+# dashboard resolves the live provider from token_usage and says "not yet called"
+# when there is nothing to report. Only non-routed facts are stated literally
+# below — an embedder, a similarity metric, an external tool with its own config.
 
 # LLM Modes (per-agent or global):
 # - mock: Fake responses for testing (fast, no API costs)
 # - local: Docker Model Runner (llama.cpp, localhost:12434)
-# - public: Cloud APIs (Groq/Anthropic/OpenAI based on tier)
+# - public: routed by rapid-llm-proxy (see above) — NOT a fixed provider
 
 # Wave Controller - Orchestrates hierarchical wave execution
 orchestrator:
@@ -88,7 +105,7 @@ agents:
     icon: GitBranch
     description: "Analyzes commit history via git CLI with LLM-powered pattern extraction. Identifies code evolution patterns, development themes, architectural decisions, and technical debt from commit messages and file changes."
     usesLLM: true
-    llmModel: "Groq: llama-3.3-70b-versatile"
+    llmModel: null
     tier: standard
     defaultLLMMode: public  # mock | local | public
     techStack: "Git CLI + SemanticAnalyzer"
@@ -102,7 +119,7 @@ agents:
     icon: MessageSquare
     description: "Uses LLM semantic analysis to extract key development topics, task/solution pairs, and workflow patterns from human-AI conversation sessions. Processes LSL session logs in parallel batches."
     usesLLM: true
-    llmModel: "Groq: llama-3.3-70b-versatile"
+    llmModel: null
     tier: standard
     defaultLLMMode: public  # mock | local | public
     techStack: SemanticAnalyzer
@@ -130,7 +147,7 @@ agents:
     icon: FileText
     description: "Links markdown docs and PlantUML diagrams to code entities. Uses LLM-powered semantic matching to resolve unresolved references and build intelligent doc-to-code mappings."
     usesLLM: true
-    llmModel: "Groq: llama-3.3-70b-versatile"
+    llmModel: null
     tier: standard
     defaultLLMMode: public  # mock | local | public
     techStack: "Regex + glob patterns + SemanticAnalyzer"
@@ -144,7 +161,7 @@ agents:
     icon: Brain
     description: "Deep code analysis to detect patterns (MVC, Factory, Observer, etc.), assess quality metrics, identify anti-patterns, and generate LLM-powered insights on architecture."
     usesLLM: true
-    llmModel: "Groq: llama-3.3-70b-versatile"
+    llmModel: null
     tier: premium
     defaultLLMMode: public  # mock | local | public
     techStack: "Direct LLM clients"
@@ -158,7 +175,7 @@ agents:
     icon: Search
     description: "Searches for similar patterns, code examples, and documentation using DuckDuckGo/Google. Optional LLM-powered result summarization and intelligent ranking of top results."
     usesLLM: true
-    llmModel: "Groq: llama-3.3-70b-versatile (optional)"
+    llmModel: null
     tier: fast
     defaultLLMMode: public  # mock | local | public
     techStack: "DuckDuckGo/Google APIs + SemanticAnalyzer"
@@ -172,7 +189,7 @@ agents:
     icon: Lightbulb
     description: "Generates comprehensive insights, PlantUML architecture diagrams, design pattern documentation, and knowledge synthesis from analysis results."
     usesLLM: true
-    llmModel: "Groq: llama-3.3-70b-versatile"
+    llmModel: null
     tier: premium
     defaultLLMMode: public  # mock | local | public
     techStack: SemanticAnalyzer
@@ -186,7 +203,7 @@ agents:
     icon: Eye
     description: "Creates structured observations for entities: pattern observations, problem-solution pairs, architectural decisions, and contextual metadata."
     usesLLM: true
-    llmModel: "Groq: llama-3.3-70b-versatile"
+    llmModel: null
     tier: premium
     defaultLLMMode: public  # mock | local | public
     techStack: SemanticAnalyzer
@@ -200,7 +217,7 @@ agents:
     icon: Tags
     description: "Maps entities to ontology classes (upper/lower) using LLM-powered semantic inference. Assigns categories, properties, and confidence scores with intelligent taxonomy alignment."
     usesLLM: true
-    llmModel: "Groq: llama-3.3-70b-versatile"
+    llmModel: null
     tier: standard
     defaultLLMMode: public  # mock | local | public
     techStack: "OntologyClassifier + SemanticAnalyzer"
@@ -214,7 +231,7 @@ agents:
     icon: Shield
     description: "Validates insights, PlantUML syntax, entity coherence. LLM-powered semantic value filtering removes low-value entities. Quality-based feedback loops (up to 3 iterations) with progressive parameter tightening."
     usesLLM: true
-    llmModel: "Groq: llama-3.3-70b-versatile"
+    llmModel: null
     tier: premium
     defaultLLMMode: public  # mock | local | public
     techStack: "SemanticAnalyzer + Semantic Value Filter"
@@ -241,7 +258,7 @@ agents:
     icon: Copy
     description: "Detects duplicate entities using cosine/semantic similarity on embeddings. Merges similar entities, removes duplicate observations, and consolidates patterns. Uses OpenAI embeddings API (not generative LLM)."
     usesLLM: false
-    llmModel: "Embeddings: text-embedding-3-small"
+    llmModel: "fastembed: all-MiniLM-L6-v2 (384-dim)"
     tier: standard
     techStack: "OpenAI Embeddings API"
     phase: 9
@@ -254,7 +271,7 @@ agents:
     icon: CheckCircle2
     description: "Validates entity accuracy against current codebase. Detects git-based staleness, verifies file/command references, and regenerates stale entity content."
     usesLLM: true
-    llmModel: "Groq: llama-3.3-70b-versatile"
+    llmModel: null
     tier: standard
     defaultLLMMode: public  # mock | local | public
     techStack: SemanticAnalyzer
