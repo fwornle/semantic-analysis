@@ -121,6 +121,56 @@ function toKebabCase(name: string): string {
     .replace(/^-|-$/g, '');
 }
 
+/**
+ * The first two lines of every diagram this agent produces, in the order they
+ * must appear — which is also why they are declared adjacently here.
+ *
+ * The include has to be the SIBLING form to resolve anywhere.
+ * `standardStylePath` below is the absolute path the style is copied FROM:
+ * correct for reading, fatal for writing. It leaked into the diagram prompt, so
+ * the model dutifully wrote
+ * `/Users/<someone>/Agentic/coding/docs/puml/_standard-style.puml` into every
+ * architecture diagram — a path that resolves on exactly one machine and renders
+ * unstyled everywhere else, including CI. 77 files on 2026-09-23, 52 more on
+ * 2026-09-27, each time repaired by hand in the commit rather than at the source.
+ *
+ * The relationship diagrams never had the bug: they are assembled in code, which
+ * always said the sibling form. Both halves now read these constants.
+ */
+const DIAGRAM_START_TAG = '@startuml';
+const STANDARD_STYLE_INCLUDE = '!include _standard-style.puml';
+
+/**
+ * Force a generated diagram onto the sibling style include.
+ *
+ * The diagram prompt asks for it, but a prompt is advice: the model has produced
+ * an absolute path, a docs/puml/-relative one, and nothing at all. Every
+ * LLM-generated diagram passes through validateAndFixPlantUML, so that is where
+ * the guarantee can be made rather than hoped for.
+ *
+ *   * Any include naming the style file collapses to the sibling form —
+ *     initializeDirectories copies the style file next to each diagram, so that
+ *     is the spelling that resolves on every machine, including CI.
+ *   * A diagram carrying no include gets one, directly after the opening tag.
+ *     An unstyled render is the failure this exists to prevent, and it is
+ *     invisible until someone looks at the PNG.
+ *
+ * Exported for the tests; nothing else should call it.
+ */
+export function normaliseStyleInclude(puml: string): string {
+  let out = puml.replace(
+    /^[ \t]*!include[ \t]+\S*_standard-style\.puml[ \t]*$/gm,
+    STANDARD_STYLE_INCLUDE
+  );
+  if (!out.includes(STANDARD_STYLE_INCLUDE)) {
+    out = out.replace(
+      new RegExp('^([ \\t]*' + DIAGRAM_START_TAG + '[^\\n]*\\n)', 'm'),
+      `$1${STANDARD_STYLE_INCLUDE}\n`
+    );
+  }
+  return out;
+}
+
 export class InsightGenerationAgent {
   private outputDir: string;
   private pumlDir: string;
@@ -2170,7 +2220,7 @@ Best practices, rules, and conventions for using this correctly. What should dev
 
     // Build PlantUML component diagram content
     const lines: string[] = ['@startuml'];
-    lines.push('!include _standard-style.puml');
+    lines.push(STANDARD_STYLE_INCLUDE);
     lines.push('');
     lines.push("title Hierarchy Context: " + entityName);
     lines.push('');
@@ -2630,6 +2680,9 @@ Best practices, rules, and conventions for using this correctly. What should dev
   private validateAndFixPlantUML(puml: string): string | null {
     let fixed = puml;
 
+    // Fix 0: the style include — see normaliseStyleInclude.
+    fixed = normaliseStyleInclude(fixed);
+
     // Fix 1: Remove newlines from alias strings (as "X\nY" is invalid syntax)
     // Pattern: as "something\nsomething" -> as "something something"
     fixed = fixed.replace(/as\s+"([^"]*?)\\n([^"]*?)"/g, 'as "$1 $2"');
@@ -2910,7 +2963,7 @@ ${analysisContext}
 **CRITICAL REQUIREMENTS (MUST FOLLOW EXACTLY):**
 1. Start with @startuml on the first line
 2. IMMEDIATELY after @startuml (on the SECOND line), include this EXACT line:
-   !include ${this.standardStylePath}
+   ${STANDARD_STYLE_INCLUDE}
 3. Do NOT define any skinparam settings - the style sheet handles all styling
 4. Use proper PlantUML syntax for the diagram type
 5. Make the diagram visually clear and informative
@@ -2920,7 +2973,7 @@ ${analysisContext}
 **Example structure:**
 \`\`\`
 @startuml
-!include ${this.standardStylePath}
+${STANDARD_STYLE_INCLUDE}
 
 ' Your diagram content here (NO skinparam definitions)
 
