@@ -17,6 +17,7 @@ import * as fs from 'fs';
 import * as path from 'path';
 import * as crypto from 'crypto';
 import { log } from '../logging.js';
+import { dataPaths } from '../data-paths.js';
 import { loadComponentManifest, flattenManifestEntries, writeManifestDiscoveries } from '../types/component-manifest.js';
 import type { DiscoveredManifestEntry } from '../types/component-manifest.js';
 // Phase 42.2 Plan 04 — legacy GraphDatabaseAdapter retired.
@@ -580,8 +581,14 @@ export class WaveController {
           });
         } else {
           const km = await import('@fwornle/km-core');
-          const dbPath = path.join(this.repositoryPath, '.data', 'knowledge-graph', 'leveldb');
-          const exportDir = path.join(this.repositoryPath, '.data', 'knowledge-graph', 'exports');
+          // Same store obs-api and sse-server open — resolved through lib/paths
+          // so all three agree. Works on the host too: a wave run in-process
+          // inside obs-api has repositoryPath = the repo root, where the helper
+          // also lives.
+          const DATA = await dataPaths(this.repositoryPath);
+          DATA.ensureDataHome();
+          const dbPath = DATA.graphDbDir();
+          const exportDir = DATA.graphExportsDir();
           // The SAME curated dir obs-api opens (its KG_ONTOLOGY_DIR). Not
           // `.data/ontologies`, which carries the host upper WITHOUT the
           // LearningArtifact axis: a standalone wave run reading that one got

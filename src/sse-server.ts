@@ -16,6 +16,7 @@ import { log, logError } from "./logging.js";
 import { setServerInstance, handleToolCall, TOOLS } from "./tools.js";
 import { createSSEBroadcaster } from "./workflow-sse-broadcaster.js";
 import { subscribe, getState } from "./workflow-state-machine.js";
+import { dataPaths } from "./data-paths.js";
 
 const PORT = parseInt(process.env.SEMANTIC_ANALYSIS_PORT || '3848', 10);
 
@@ -68,9 +69,21 @@ app.use(express.json());
 // exports} + .data/ontologies inside the container at /coding/).
 // ---------------------------------------------------------------------------
 const REPOSITORY_PATH = process.env.REPOSITORY_PATH || '/coding';
+
+// The graph store lives under the DATA root, not the repo — obs-api on the host
+// opens this same LevelDB (hence the documented LOCK contention), so both sides
+// MUST derive it from lib/paths or they silently hold two different graphs.
+//
+// Top-level await is available here (module ESNext, target ES2022) and the store
+// has to exist before the routes below are built.
+//
+// `ontologyDir` deliberately stays under REPOSITORY_PATH: ontologies are shipped
+// schema that every install needs an identical copy of, not user data.
+const DATA = await dataPaths(REPOSITORY_PATH);
+DATA.ensureDataHome();
 const kmStore = new GraphKMStore({
-  dbPath: path.join(REPOSITORY_PATH, '.data', 'knowledge-graph', 'leveldb'),
-  exportDir: path.join(REPOSITORY_PATH, '.data', 'knowledge-graph', 'exports'),
+  dbPath: DATA.graphDbDir(),
+  exportDir: DATA.graphExportsDir(),
   ontologyDir: path.join(REPOSITORY_PATH, '.data', 'ontologies'),
   domains: ['coding'],
   debounceMs: 5000,
@@ -96,7 +109,7 @@ kmRouter.use((_req: Request, res: Response, next: express.NextFunction) => {
 // satisfies the framework-agnostic Router contract.
 createKmCoreRouter(kmStore, kmRouter as unknown as Parameters<typeof createKmCoreRouter>[1], {
   ontologyRegistry: kmStore.ontology,
-  snapshotDir: path.join(REPOSITORY_PATH, '.data', 'knowledge-graph', 'exports'),
+  snapshotDir: DATA.graphExportsDir(),
   restartCommand: 'docker-compose restart coding-services',
 });
 app.use('/api/v1', kmRouter);
