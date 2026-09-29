@@ -85,7 +85,21 @@ const kmStore = new GraphKMStore({
   dbPath: DATA.graphDbDir(),
   exportDir: DATA.graphExportsDir(),
   ontologyDir: path.join(REPOSITORY_PATH, '.data', 'ontologies'),
-  domains: ['coding'],
+  // No `domains`. It used to say `['coding']`, which was a tenant name in a
+  // slot that holds TOPIC names — the only writers of `metadata.domain` set
+  // 'development-workflow', 'pattern-analysis', 'cross-analysis'. So it could
+  // never match: measured, 3109 of 3109 nodes carry no domain at all, the
+  // exporter bucketed every one of them to `general.json` (34 MB, live), and
+  // the `coding.json` it materialised has sat at 142 empty bytes since June.
+  //
+  // It also made this store DISAGREE with obs-api, which opens the same
+  // directory and omits `domains` — km-core's `general` fallback
+  // (store/persistence.ts:188) papered over it on read. Omitting it here makes
+  // both openers resolve the same default, `['general']`.
+  //
+  // Deliberately NOT `[resolveScope()]`: that would put a tenant name in a
+  // topic slot under a different spelling, make the export FILENAME depend on
+  // the scope, and give every colleague their own permanently-empty bucket.
   debounceMs: 5000,
 });
 let kmStoreReady = false;
