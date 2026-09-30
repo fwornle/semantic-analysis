@@ -2559,8 +2559,7 @@ Respond with a JSON array:
       // Check for known command scripts
       const commandPaths = [
         { cmd: 'vkb', path: 'bin/vkb' },
-        { cmd: 'coding', path: 'bin/coding' },
-        { cmd: 'graph-sync', path: 'bin/graph-sync' }
+        { cmd: 'coding', path: 'bin/coding' }
       ];
 
       for (const { cmd, path: cmdPath } of commandPaths) {
