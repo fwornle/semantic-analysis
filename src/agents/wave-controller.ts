@@ -23,6 +23,7 @@ import type { DiscoveredManifestEntry } from '../types/component-manifest.js';
 // Phase 42.2 Plan 04 — legacy GraphDatabaseAdapter retired.
 // All persistence (read + write) routes through the km-core adapter.
 import { createKmCoreAdapter, type KmCoreAdapter } from '../storage/km-core-adapter.js';
+import { acquireKmStore, type AcquiredStore } from '../storage/km-store-host.js';
 import { buildSessionFactIndex, type SessionFactIndex } from '../knowledge/session-facts.js';
 // Phase 42 Plan 07 Phase B1 — KM_CORE_PERSISTENCE feature flag REMOVED.
 // km-core is now the unconditional persistence backend. Legacy graphDB writes
@@ -107,6 +108,7 @@ export class WaveController {
   private sessionFacts?: SessionFactIndex;
   /** Caller-owned km-core store, when running in the owner's process. */
   private injectedKmStore?: object;
+  private acquiredStore?: AcquiredStore;
   private reportAgent: WorkflowReportAgent;
   private qaAgent: QualityAssuranceAgent;
   /** Per-step LLM metrics and outputs accumulated during execution */
@@ -566,54 +568,40 @@ export class WaveController {
       // — the canonical store after Phase 42.2 Plan 05's atomic dir-swap.
       // (Pre-swap, this pointed at .data/knowledge-graph-migrated/ as a
       // Phase 42-07 Phase A transitional measure; Plan 05 collapsed the two
-      // dirs into the single canonical location and reverted this path.)
+      // dirs into the single canonical location and reverted this path. Three
+      // OTHER openers kept the transitional path until 2026-10-01 and were
+      // addressing a directory that existed nowhere.)
+      //
+      // The curated `.data/ontologies/obs-api/` dir IS now the strict superset
+      // this comment used to claim it was. It wasn't: it carried four symlinks
+      // plus learning-artifacts.json and was MISSING six ontologies the parent
+      // has (cluster-reprocessing, code-entities, development-knowledge, raas,
+      // resi, ui). Those six were added as relative symlinks alongside the
+      // existing ones, so there is still one copy of each ontology on disk.
       try {
-        if (this.injectedKmStore) {
-          // In-process run inside the store's owner (obs-api). The store is
-          // already open and stays open after we finish — do NOT open or close
-          // it here. See WaveControllerConfig.kmStore for why this exists.
-          this.kmCoreAdapter = createKmCoreAdapter({
-            store: this.injectedKmStore as never,
-            team: this.team,
-          });
-          log('[WaveController] km-core adapter initialized (caller-owned store)', 'info', {
-            owner: 'injected',
-          });
-        } else {
-          const km = await import('@fwornle/km-core');
-          // Same store obs-api and sse-server open — resolved through lib/paths
-          // so all three agree. Works on the host too: a wave run in-process
-          // inside obs-api has repositoryPath = the repo root, where the helper
-          // also lives.
-          const DATA = await dataPaths(this.repositoryPath);
-          DATA.ensureDataHome();
-          const dbPath = DATA.graphDbDir();
-          const exportDir = DATA.graphExportsDir();
-          // The SAME curated dir obs-api opens (its KG_ONTOLOGY_DIR). Not
-          // `.data/ontologies`, which carries the host upper WITHOUT the
-          // LearningArtifact axis: a standalone wave run reading that one got
-          // a registry with no Observation/Digest/Insight in it, while the
-          // in-process run (which uses the caller's injected store) got all
-          // 61 classes. Same database, two vocabularies, decided by how the
-          // process happened to be launched.
-          //
-          // The curated dir is a strict superset and its members are symlinks
-          // back to the canonical files, so there is one copy of each
-          // ontology on disk and no regeneration step to forget.
-          const ontologyDir = path.join(this.repositoryPath, '.data', 'ontologies', 'obs-api');
-          const store = new km.GraphKMStore({
-            dbPath,
-            exportDir,
-            ontologyDir,
-            domains: [this.team],
-            debounceMs: 5000,
-          });
-          await store.open();
-          this.kmCoreAdapter = createKmCoreAdapter({ store, team: this.team });
-          log('[WaveController] km-core adapter initialized (private store)', 'info', {
-            dbPath, exportDir, ontologyDir,
-          });
-        }
+        // One construction path for every caller — see storage/km-store-host.ts.
+        // It keeps the two behaviours this code already had:
+        //
+        //   injected      in-process inside the store's OWNER (obs-api). Already
+        //                 open, and stays open after we finish, so release() is
+        //                 a no-op — do NOT close a store you borrowed.
+        //   not injected  a private store at the canonical dbPath, opened against
+        //                 the curated ontology dir obs-api uses, because
+        //                 `.data/ontologies` lacks the LearningArtifact axis and
+        //                 a standalone run would see a different vocabulary over
+        //                 the same database depending on how it was launched.
+        //
+        // `domains` is gone: it is a TOPIC slot, and a tenant name there matched
+        // nothing while making the export filename scope-dependent.
+        this.acquiredStore = await acquireKmStore({
+          repositoryPath: this.repositoryPath,
+          team: this.team,
+          injected: this.injectedKmStore ?? undefined,
+        });
+        this.kmCoreAdapter = this.acquiredStore.adapter;
+        log('[WaveController] km-core adapter initialized', 'info', {
+          owner: this.acquiredStore.owned ? 'private' : 'injected',
+        });
       } catch (e) {
         // Bootstrap failure is now fatal — the legacy persistence-agent path
         // was removed in Phase B1. Surface to the caller so the workflow

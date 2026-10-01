@@ -18,6 +18,8 @@ import { HierarchyClassifierAgent } from "./hierarchy-classifier.js";
 // PersistenceAgent + GraphDatabaseAdapter deleted; consumer call sites
 // rewired to the km-core adapter (Phase 42-01 strangler surface).
 import { createKmCoreAdapter, type KmCoreAdapter } from "../storage/km-core-adapter.js";
+import { acquireKmStore, type AcquiredStore } from "../storage/km-store-host.js";
+import { requireTenant, tenantFilter } from "../scope.js";
 import {
   saveSuccessfulWorkflowCompletion as saveCompletionMarker,
   linkInsightDocuments as linkInsightsViaAdapter,
@@ -338,7 +340,14 @@ export class CoordinatorAgent {
   private agents: Map<string, any> = new Map();
   private running: boolean = true;
   private repositoryPath: string;
-  private team: string;
+  /**
+   * The tenant, when the caller named one. `undefined` means "resolve it from
+   * the installation", which happens lazily in `tenant()` — never in the
+   * constructor, so an unscoped machine can still CONSTRUCT this agent and use
+   * its read-only surface.
+   */
+  private team: string | undefined;
+  private acquiredStore: AcquiredStore | null = null;
   // Phase 42.2 Plan 04 — km-core adapter replaces the legacy GraphDatabaseAdapter.
   // Constructed lazily inside doInitializeAgents() so we can use the same
   // GraphKMStore bootstrap path as wave-controller.ts (matching dbPath +
@@ -351,7 +360,12 @@ export class CoordinatorAgent {
   private smartOrchestrator: SmartOrchestrator;
   private traceReport: UKBTraceReportManager | null = null;
 
-  constructor(repositoryPath: string = '.', team: string = 'coding') {
+  // `team` is no longer defaulted to 'coding'. Defaulting it here tagged every
+  // colleague's knowledge with this repo's own tenant name; resolving it here
+  // instead would make construction throw on an unscoped machine, including on
+  // read-only paths. So it stays undefined and `tenant()` decides, at the one
+  // moment the answer gets written down.
+  constructor(repositoryPath: string = '.', team?: string) {
     this.repositoryPath = repositoryPath;
     this.team = team;
     // Phase 42.2 Plan 04 — km-core adapter bootstrapped lazily during
@@ -370,8 +384,33 @@ export class CoordinatorAgent {
       defaultStepTimeout: orchConfig.default_step_timeout,
     });
     this.initializeWorkflows();
+    // (tenant() resolves the scope lazily — see below. Nothing here may throw.)
     // Note: Agents are initialized lazily when executeWorkflow is called
     // This avoids constructor side effects and race conditions
+  }
+
+  /**
+   * The tenant to WRITE with. Throws on an unscoped installation.
+   *
+   * Strict, because the answer is persisted onto entities and a tenant is
+   * permanent. Deliberately a method and not a constructor-resolved field:
+   * resolving eagerly would make `new CoordinatorAgent(repo)` throw on a machine
+   * with no `~/.coding/scope`, including for callers that only read.
+   */
+  private async tenant(): Promise<string> {
+    if (this.team) return this.team;
+    return requireTenant(this.repositoryPath);
+  }
+
+  /**
+   * The tenant to FILTER by, or undefined for "every tenant".
+   *
+   * Never the placeholder: a query narrowed to `team: 'default'` returns nothing
+   * and is indistinguishable from a knowledge base that lost its content.
+   */
+  private async tenantForRead(): Promise<string | undefined> {
+    if (this.team) return this.team;
+    return tenantFilter(this.repositoryPath);
   }
 
   /**
@@ -1798,20 +1837,26 @@ export class CoordinatorAgent {
       // construction path at lines ~510-525 — same dbPath / ontologyDir /
       // exportDir / domains, so both readers see the same canonical store.
       try {
-        const km = await import('@fwornle/km-core');
-        const dbPath = path.join(this.repositoryPath, '.data', 'knowledge-graph-migrated', 'leveldb');
-        const exportDir = path.join(this.repositoryPath, '.data', 'knowledge-graph-migrated', 'exports');
-        const ontologyDir = path.join(this.repositoryPath, '.data', 'ontologies');
-        const store = new km.GraphKMStore({
-          dbPath,
-          exportDir,
-          ontologyDir,
-          domains: [this.team],
-          debounceMs: 5000,
+        // KNOWN CONSEQUENCE, accepted deliberately. This used to address
+        // `.data/knowledge-graph-migrated/`, which exists nowhere — so a
+        // workflow run here wrote into a store nothing reads and never
+        // contended with anyone. Now it addresses the canonical LevelDB, which
+        // is single-owner-rw.
+        //
+        // workflow-runner.ts spawns this agent in a DETACHED child, and a child
+        // cannot take the lock while obs-api holds it. So batch-analysis /
+        // incremental-analysis / complete-analysis now FAIL here, loudly, where
+        // they previously "succeeded" into a void. That is the same trade
+        // wave-analysis already made (see tools.ts: "Fail here, naming the
+        // cause"); the fix for those three is to hand them to obs-api over HTTP
+        // the way wave-analysis is handed over.
+        const acquired = await acquireKmStore({
+          repositoryPath: this.repositoryPath,
+          team: await this.tenant(),
         });
-        await store.open();
-        this.adapter = createKmCoreAdapter({ store, team: this.team });
-        log('km-core adapter initialized', 'info', { dbPath, exportDir, ontologyDir });
+        this.adapter = acquired.adapter;
+        this.acquiredStore = acquired;
+        log('km-core adapter initialized', 'info', { owned: acquired.owned });
       } catch (e) {
         log('km-core adapter bootstrap failed (fatal — no legacy fallback)', 'error', {
           error: e instanceof Error ? e.message : String(e),
@@ -4760,7 +4805,11 @@ export class CoordinatorAgent {
             // the same no-op-on-missing semantics that the rollback relied on.
             const adapterForRollback = this.agents.get('persistence') as KmCoreAdapter | undefined;
             if (adapterForRollback) {
-              await adapterForRollback.deleteEntity(action.target, this.team);
+              // Strict: a delete addresses a specific tenant's entity. Rolling
+              // back against the placeholder would target a tenant nobody owns
+              // and silently remove nothing, leaving the failed run's entity
+              // behind.
+              await adapterForRollback.deleteEntity(action.target, await this.tenant());
               log(`Rollback: Removed entity ${action.target}`, 'info');
             }
             break;
@@ -5395,14 +5444,17 @@ Expected locations for generated files:
       this.monitorIntervalId = null;
     }
 
-    // Close graph database connection (Phase 42.2 Plan 04 — km-core adapter)
+    // Release the store. release(), NOT adapter.close(): when the store was
+    // borrowed from the hosting process, closing it would persist the whole
+    // graph and drop the handle that process is still serving from.
     try {
-      if (this.adapter) {
-        await this.adapter.close();
-        log("km-core adapter closed", "info");
+      if (this.acquiredStore) {
+        await this.acquiredStore.release();
+        this.acquiredStore = null;
+        log("km-core store released", "info");
       }
     } catch (error) {
-      log("Failed to close km-core adapter", "error", error);
+      log("Failed to release km-core store", "error", error);
     }
 
     // Clear agents

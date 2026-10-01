@@ -40,6 +40,7 @@ import { HIERARCHY_ROOTS, HIERARCHY_ROOT_CLASS, isHierarchyRoot } from '@fwornle
 // Phase 60 Plan 09 — deterministic L2 refinement (SC#5 / LOWERONTO-03). Shared
 // closed-vocabulary keyword mapper, also imported by the backfill migration.
 import { classifyL2 } from './l2-subsystem-classifier.js';
+import { repositoryRoot } from '../data-paths.js';
 // Surface witness — touching the named exports at runtime forces the import
 // to be retained by tree-shakers. HIERARCHY_ROOTS itself is referenced by
 // the test file so it cannot be dead-code-eliminated; this constant keeps
@@ -275,7 +276,7 @@ export class OntologyClassificationAgent {
 
   constructor(team: string = 'coding', repositoryPath?: string) {
     this.team = team;
-    this.basePath = repositoryPath || process.env.KNOWLEDGE_BASE_PATH || process.cwd();
+    this.basePath = repositoryPath || process.env.KNOWLEDGE_BASE_PATH || repositoryRoot();
     this.semanticAnalyzer = new SemanticAnalyzer();
   }
 

@@ -64,12 +64,18 @@ export interface KmCoreAdapter {
   readonly initialized: boolean;
 
   /**
-   * Phase 42.2 Plan 04 — legacy compatibility surface.
-   * Legacy `GraphDatabaseAdapter.close()` closed the LevelDB handle. km-core
-   * stores are managed by the caller (the wave-controller / tools handler
-   * owns the GraphKMStore lifecycle); this method is a no-op forwarded to
-   * the underlying store if the store exposes one. Retained for drop-in
-   * compatibility.
+   * Close the underlying store. NOT a no-op, despite what this comment used to
+   * claim ("km-core 0.1.x does not expose close").
+   *
+   * `GraphKMStore.close()` exists, `persistOnClose` defaults to true, and it
+   * calls `persistGraph(graph.export())` — rewriting the WHOLE graph — and then
+   * closes the LevelDB handle. Calling it on a store you BORROWED from another
+   * component therefore persists the entire graph and drops that component's
+   * handle out from under it.
+   *
+   * Do not call this directly. Go through `AcquiredStore.release()` in
+   * `./km-store-host.ts`, which knows whether the store is owned or borrowed.
+   * `tests/scope/phantom-store.test.mjs` asserts this is the only caller.
    */
   close(): Promise<void>;
 
@@ -390,10 +396,13 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
   // initialize / close / initialized — Phase 42.2 Plan 04 compat shims
   //
   // The legacy GraphDatabaseAdapter exposed these for the LevelDB handle
-  // lifecycle. km-core's GraphKMStore opens the store at construction time,
-  // so initialize is a no-op and initialized is always true. close forwards
-  // to store.close() if the store exposes one (it currently does not as of
-  // km-core 0.1.x, so close is also effectively a no-op).
+  // lifecycle. km-core's GraphKMStore opens the store at construction time, so
+  // initialize is a no-op and initialized is always true.
+  //
+  // close() is NOT a no-op — the previous version of this comment said it was,
+  // on the grounds that km-core 0.1.x did not expose close(). It does
+  // (GraphKMStore.close(), persistOnClose defaults to true), so this forwards a
+  // whole-graph persist plus a LevelDB handle close. See the interface doc.
   // -------------------------------------------------------------------------
 
   async function initialize(): Promise<void> {
@@ -401,7 +410,8 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
   }
 
   async function close(): Promise<void> {
-    // No-op — caller owns store lifecycle.
+    // Forwards a whole-graph persist and a handle close. Reachable only through
+    // AcquiredStore.release(), which knows if the store is ours to close.
     const maybeClose = (store as unknown as { close?: () => Promise<void> }).close;
     if (typeof maybeClose === 'function') {
       await maybeClose.call(store);

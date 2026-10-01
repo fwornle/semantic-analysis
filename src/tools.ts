@@ -15,6 +15,9 @@ import { CodeGraphAgent } from "./agents/code-graph-agent.js";
 // Phase 42.2 Plan 04 — GraphDatabaseAdapter retired in favor of the
 // km-core adapter (Phase 42-01 strangler surface).
 import { createKmCoreAdapter, type KmCoreAdapter } from "./storage/km-core-adapter.js";
+import { acquireKmStore, type AcquiredStore } from "./storage/km-store-host.js";
+import { requireTenant } from "./scope.js";
+import { repositoryRoot } from "./data-paths.js";
 import { cleanupEntityFiles as cleanupEntityFilesViaAdapter } from "./storage/legacy-consumer-helpers.js";
 import {
   OntologyConfigManager,
@@ -973,44 +976,38 @@ async function handleCreateUkbEntity(args: any): Promise<any> {
     tags,
   });
 
-  // Phase 42.2 Plan 04 — direct km-core persistence via the strangler adapter
-  // (Phase 42-01). Replaces the legacy GraphDatabaseAdapter + PersistenceAgent
-  // pair. Constructs a GraphKMStore with the canonical-shape dbPath +
-  // ontologyDir (CLAUDE.md mandate) and writes a single entity via
-  // adapter.storeEntity.
-  const repositoryPath = process.env.REPOSITORY_PATH || process.cwd();
-  const km = await import('@fwornle/km-core');
-  const dbPath = path.join(repositoryPath, '.data', 'knowledge-graph-migrated', 'leveldb');
-  const exportDir = path.join(repositoryPath, '.data', 'knowledge-graph-migrated', 'exports');
-  const ontologyDir = path.join(repositoryPath, '.data', 'ontologies');
-  const store = new km.GraphKMStore({
-    dbPath,
-    exportDir,
-    ontologyDir,
-    domains: ['coding'],
-    debounceMs: 5000,
-  });
-  await store.open();
-  const adapter = createKmCoreAdapter({ store, team: 'coding' });
+  // Persistence goes through acquireKmStore, which borrows the store this
+  // process already has open when there is one. This used to construct its own
+  // GraphKMStore under `.data/knowledge-graph-migrated/` — a directory that
+  // exists nowhere — so every entity this tool "created" was written to a store
+  // nothing reads. See storage/km-store-host.ts.
+  //
+  // `team` is STRICT: it is written onto the entity and a tenant is permanent,
+  // so an unscoped install must refuse rather than tag this `default`.
+  const team = await requireTenant();
+  const acquired = await acquireKmStore({ team });
 
   let success = false;
   let details = '';
   try {
-    const result = await adapter.storeEntity(
+    const result = await acquired.adapter.storeEntity(
       {
         name: entity_name,
         entityType: entity_type,
         observations: [insights, ...(tags?.map((t: string) => `Tag: ${t}`) || [])],
         significance: significance || 5,
       },
-      { team: 'coding' },
+      { team },
     );
     success = !!result.id;
     details = `Entity id: ${result.id}`;
   } catch (err) {
     details = `storeEntity failed: ${err instanceof Error ? err.message : String(err)}`;
   } finally {
-    await adapter.close();
+    // release(), never adapter.close(): when the store is borrowed from
+    // sse-server, closing it would persist the whole graph and drop the handle
+    // that process is still serving /api/v1 from.
+    await acquired.release();
   }
 
   return {
@@ -2517,7 +2514,7 @@ async function handleResetAnalysisCheckpoint(args: any): Promise<any> {
       description = 'cleared (will re-analyze from the beginning)';
     }
 
-    const repositoryPath = process.env.REPOSITORY_PATH || process.cwd();
+    const repositoryPath = repositoryRoot();
 
     // IMPORTANT: Reset BOTH checkpoint locations
     // 1. Primary: .data/workflow-checkpoints.json (used by CheckpointManager)
@@ -2633,46 +2630,44 @@ async function handleRefreshEntity(args: any): Promise<any> {
     check_entity_name: shouldCheckName, cleanup_stale_files, parallel_workers
   });
 
+  // Declared outside the try so the finally can release it. This handler used to
+  // open a store and never close it at all.
+  let acquired: AcquiredStore | null = null;
+
   try {
-    const repositoryPath = process.env.REPOSITORY_PATH || process.cwd();
+    const repositoryPath = repositoryRoot();
+
+    // `'*'` means EVERY tenant, and collapsing it to `'coding'` conflated "all"
+    // with "one specific one" — which is how this tool came to validate one
+    // team's entities while claiming to sweep them all. Two distinct values:
+    //
+    //   teamFilter   what to READ — undefined means "no filter", every tenant
+    //   teamForWrite what to TAG a refreshed entity with — strict, because that
+    //                tenant is permanent
+    const teamFilter = (!team || team === '*') ? undefined : team;
+    const teamForWrite = teamFilter ?? (await requireTenant(repositoryPath));
 
     // Initialize ContentValidationAgent with required dependencies
     const contentValidationAgent = new ContentValidationAgent({
       repositoryPath,
       enableDeepValidation: true,
-      team: team === '*' ? 'coding' : team
+      team: teamForWrite
     });
 
-    // Phase 42.2 Plan 04 — initialize the km-core adapter (replaces the
-    // legacy GraphDatabaseAdapter + PersistenceAgent pair). Same dbPath +
-    // ontologyDir + exportDir as wave-controller / coordinator. The single
-    // setKmCoreAdapter call replaces the legacy setGraphDB + setPersistenceAgent
-    // pair (collapsed in Phase 42.2 Plan 04 Task 3).
-    const teamForAdapter = team === '*' ? 'coding' : team;
-    const km = await import('@fwornle/km-core');
-    const dbPath = path.join(repositoryPath, '.data', 'knowledge-graph-migrated', 'leveldb');
-    const exportDir = path.join(repositoryPath, '.data', 'knowledge-graph-migrated', 'exports');
-    const ontologyDir = path.join(repositoryPath, '.data', 'ontologies');
-    const store = new km.GraphKMStore({
-      dbPath,
-      exportDir,
-      ontologyDir,
-      domains: [teamForAdapter],
-      debounceMs: 5000,
-    });
-    await store.open();
-    const adapter: KmCoreAdapter = createKmCoreAdapter({ store, team: teamForAdapter });
-    contentValidationAgent.setKmCoreAdapter(adapter);
+    // The store comes from acquireKmStore, which borrows the one this process
+    // already has open. This used to build its own against
+    // `.data/knowledge-graph-migrated/` — a directory that exists nowhere — so
+    // this tool has been scoring entities against an empty graph.
+    acquired = await acquireKmStore({ repositoryPath, team: teamForWrite });
+    contentValidationAgent.setKmCoreAdapter(acquired.adapter as KmCoreAdapter);
 
     // Single entity refresh vs batch refresh
     if (entity_name === '*') {
       // Batch refresh mode
-      const teamParam = team === '*' ? undefined : team;
-
-      log(`Starting batch refresh`, "info", { team: teamParam, dry_run, max_entities });
+      log(`Starting batch refresh`, "info", { team: teamFilter, dry_run, max_entities });
 
       const batchResult = await contentValidationAgent.refreshAllStaleEntities({
-        team: teamParam,
+        team: teamFilter,
         scoreThreshold: score_threshold,
         dryRun: dry_run,
         maxEntities: max_entities,
@@ -2776,9 +2771,12 @@ async function handleRefreshEntity(args: any): Promise<any> {
         let cleanupResult: { deletedFiles: string[]; errors: string[] } | undefined;
         if (cleanup_stale_files) {
           const insightsDir = path.join(repositoryPath, 'knowledge-management', 'insights');
-          cleanupResult = await cleanupEntityFilesViaAdapter(adapter, insightsDir, {
+          cleanupResult = await cleanupEntityFilesViaAdapter(acquired.adapter, insightsDir, {
             entityName: entity_name === '*' ? undefined : entity_name,
-            team: team,
+            // Orphan detection is a READ, so the placeholder must mean "every
+            // tenant" rather than a tenant literally called 'default' — which
+            // would match nothing and silently clean up nothing.
+            team: teamFilter,
             cleanOrphans: entity_name === '*'
           });
         }
@@ -2867,6 +2865,10 @@ async function handleRefreshEntity(args: any): Promise<any> {
   } catch (error) {
     log(`Error refreshing entity`, "error", error);
     throw error;
+  } finally {
+    // release(), never adapter.close(): a borrowed store belongs to the process
+    // that opened it and is still serving /api/v1 from the same handle.
+    await acquired?.release();
   }
 }
 
@@ -2884,7 +2886,7 @@ let ontologyConfigManager: OntologyConfigManager | null = null;
  */
 async function getOntologyConfigManager(): Promise<OntologyConfigManager> {
   if (!ontologyConfigManager) {
-    const basePath = process.env.KNOWLEDGE_BASE_PATH || process.cwd();
+    const basePath = process.env.KNOWLEDGE_BASE_PATH || repositoryRoot();
     const defaultConfig: ExtendedOntologyConfig = {
       enabled: true,
       upperOntologyPath: path.join(basePath, '.data/ontologies/development-knowledge-ontology.json'),
@@ -3059,7 +3061,7 @@ async function handleListOntologyClasses(args: {
   const config = configManager.getConfig();
 
   // Load and parse ontology files
-  const basePath = process.env.KNOWLEDGE_BASE_PATH || process.cwd();
+  const basePath = process.env.KNOWLEDGE_BASE_PATH || repositoryRoot();
 
   let classes: Array<{
     name: string;
@@ -3289,7 +3291,7 @@ async function handleSuggestOntologyExtension(args: {
 
   const configManager = await getOntologyConfigManager();
   const config = configManager.getConfig();
-  const basePath = process.env.KNOWLEDGE_BASE_PATH || process.cwd();
+  const basePath = process.env.KNOWLEDGE_BASE_PATH || repositoryRoot();
 
   // Load pending suggestions
   const suggestionsPath = path.join(

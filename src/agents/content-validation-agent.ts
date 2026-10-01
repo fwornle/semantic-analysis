@@ -2853,7 +2853,7 @@ Respond with a JSON array:
       if (codebaseState.existingComponents?.includes('GraphKMStore')) {
         observations.push({
           type: 'workflow',
-          content: `GraphKMStore (km-core) exports the canonical entity snapshot to .data/knowledge-graph-migrated/exports on debounce; .data/knowledge-export/<team>.json is regenerated at workflow completion via exportKnowledgeToJSON`,
+          content: `GraphKMStore (km-core) exports the canonical entity snapshot to the data root's kb/knowledge-graph/exports on debounce, resolved through lib/paths rather than hardcoded under the repo`,
           date: now,
           metadata: { confidence: 0.95, source: 'codebase-scan', refreshedAt: now }
         });

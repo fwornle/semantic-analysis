@@ -21,7 +21,7 @@
  */
 
 import path from 'node:path';
-import { pathToFileURL } from 'node:url';
+import { fileURLToPath, pathToFileURL } from 'node:url';
 
 /** The subset of lib/paths this package uses. */
 export interface DataPaths {
@@ -44,6 +44,47 @@ export interface DataPaths {
   explain(): Record<string, unknown>;
 }
 
+/**
+ * Where the repo root is, for every consumer in this package.
+ *
+ * WHY THIS EXISTS. Four idioms disagreed, inside one package and sometimes
+ * inside one process:
+ *
+ *   sse-server.ts    REPOSITORY_PATH || '/coding'          correct in-container
+ *   tools.ts         REPOSITORY_PATH || process.cwd()      WRONG: in-container the
+ *                                                          cwd is .../integrations/
+ *                                                          semantic-analysis, which
+ *                                                          put the LevelDB in the
+ *                                                          container's writable
+ *                                                          layer and pointed
+ *                                                          ontologyDir at a
+ *                                                          directory that does not
+ *                                                          exist
+ *   tools.ts         CODING_ROOT || repositoryPath
+ *   wave-controller  constructor-injected
+ *
+ * And `REPOSITORY_PATH` is set by NOBODY anywhere in the repo — not compose, not
+ * the Dockerfile, not a plist — so every one of those was running on its
+ * fallback.
+ *
+ * The derived-from-module-location step is what makes the stdio-MCP entry points
+ * (`server.ts`, `index.ts`) work on the HOST, where none of these variables is
+ * set and `'/coding'` does not exist. From `dist/data-paths.js`, three levels up
+ * is the package root's parent chain to the repo.
+ */
+export function repositoryRoot(explicit?: string): string {
+  const fromEnv =
+    process.env.REPOSITORY_PATH || process.env.CODING_ROOT || process.env.CODING_REPO;
+  if (explicit && explicit.trim() && explicit.trim() !== '.') return explicit;
+  if (fromEnv && fromEnv.trim()) return fromEnv;
+  try {
+    // dist/data-paths.js → dist → semantic-analysis → integrations → repo root
+    return fileURLToPath(new URL('../../../..', import.meta.url));
+  } catch {
+    return '/coding';
+  }
+}
+
 let cached: DataPaths | null = null;
 
 /**
@@ -52,7 +93,7 @@ let cached: DataPaths | null = null;
  */
 export async function dataPaths(repositoryPath?: string): Promise<DataPaths> {
   if (cached) return cached;
-  const root = repositoryPath || process.env.REPOSITORY_PATH || '/coding';
+  const root = repositoryRoot(repositoryPath);
   const href = pathToFileURL(path.join(root, 'lib', 'paths', 'index.mjs')).href;
   const mod = (await import(href)) as { default?: DataPaths } & Partial<DataPaths>;
   const impl = mod.default ?? (mod as DataPaths);

@@ -16,7 +16,8 @@ import { log, logError } from "./logging.js";
 import { setServerInstance, handleToolCall, TOOLS } from "./tools.js";
 import { createSSEBroadcaster } from "./workflow-sse-broadcaster.js";
 import { subscribe, getState } from "./workflow-state-machine.js";
-import { dataPaths } from "./data-paths.js";
+import { dataPaths, repositoryRoot } from "./data-paths.js";
+import { setKmStoreProvider } from "./storage/km-store-host.js";
 
 const PORT = parseInt(process.env.SEMANTIC_ANALYSIS_PORT || '3848', 10);
 
@@ -68,7 +69,7 @@ app.use(express.json());
 // the canonical wave-controller convention (.data/knowledge-graph/{leveldb,
 // exports} + .data/ontologies inside the container at /coding/).
 // ---------------------------------------------------------------------------
-const REPOSITORY_PATH = process.env.REPOSITORY_PATH || '/coding';
+const REPOSITORY_PATH = repositoryRoot();
 
 // The graph store lives under the DATA root, not the repo — obs-api on the host
 // opens this same LevelDB (hence the documented LOCK contention), so both sides
@@ -103,6 +104,19 @@ const kmStore = new GraphKMStore({
   debounceMs: 5000,
 });
 let kmStoreReady = false;
+
+// Tell the tool handlers that THIS process owns the store, so they borrow it
+// instead of opening a second LevelDB handle on the same directory.
+//
+// `handleToolCall` is imported from ./tools.js and is reachable from
+// POST /tool/:name the instant Express starts listening, so this is registered
+// at construction rather than after open(): during hydration the correct answer
+// is "not ready yet", not "no host". The predicate is deliberately the same one
+// the /api/v1 503 gate uses below, so the HTTP gate and the in-process gate
+// cannot drift apart and disagree about whether the graph is usable.
+setKmStoreProvider(() =>
+  kmStoreReady && (kmStore as unknown as { graph?: unknown }).graph ? kmStore : null,
+);
 
 const kmRouter = Router();
 kmRouter.use((_req: Request, res: Response, next: express.NextFunction) => {
