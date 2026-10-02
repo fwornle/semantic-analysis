@@ -105,7 +105,7 @@ export interface KmCoreAdapter {
    * B's SharedMemoryEntity-ish shape into the canonical km-core Entity per
    * D-54. Returns `{ id }` matching B's existing return contract.
    *
-   * Phase 57 D-04 — `options.project` (optional) carries the closed-set
+   * Phase 57 D-04 — `options.project` (optional) carries the
    * project tag. When set and valid per `isProject()`, it is stamped into
    * `metadata.project` as a defence-in-depth dual stamp alongside the
    * canonical-mapper's primary stamp.
@@ -524,13 +524,13 @@ export function createKmCoreAdapter(opts: CreateKmCoreAdapterOptions): KmCoreAda
         ? options.team
         : undefined;
 
-    // Phase 57 D-04 — defence-in-depth dual stamp for the closed-set
+    // Phase 57 D-04 — defence-in-depth dual stamp for the
     // `metadata.project` tag. Mirrors the Gap 4 team dual-stamp above:
     // the canonical-mapper has the PRIMARY stamp; here at the actual
     // putEntity call site we also stamp project so any writer path that
     // bypasses canonical-mapper (e.g., renameEntity / direct ad-hoc calls)
     // still emits the project tag. `isProject()` from km-core is the
-    // closed-set typeguard (D-03). Defaulting to 'coding' is intentionally
+    // tenant-id typeguard (D-03). Defaulting to 'coding' is intentionally
     // NOT done here — the canonical-mapper / wave-controller boundary owns
     // the default; stamping a hardcoded value here would silently mask
     // upstream bugs (per Plan 57-03 Task 2 action).
