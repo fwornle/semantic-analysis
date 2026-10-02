@@ -15,12 +15,13 @@
 
 import * as fs from 'fs';
 import * as path from 'path';
-import { CoordinatorAgent } from './agents/coordinator.js';
+import type { CoordinatorAgent } from './agents/coordinator.js';
 import { log } from './logging.js';
-import { loadAllWorkflows, getConfigDir, loadWorkflowRunnerConfig } from './utils/workflow-loader.js';
-import { dispatch, subscribe, reset, createProgressFileSubscriber } from './workflow-state-machine.js';
+import { dispatch } from './workflow-state-machine.js';
 import { InvalidTransitionError } from './shared/workflow-types/transitions.js';
 import { writeTerminalState } from './workflow-runner-terminal-write.js';
+import { requireTenant } from './scope.js';
+import { runCoordinatorWorkflow } from './run-coordinator-workflow.js';
 
 // ============================================================================
 // CRASH RECOVERY: Module-level state for signal handlers
@@ -150,36 +151,6 @@ process.on('exit', (code) => {
   }
 });
 
-// Batch step names for phase separation - derived from workflow YAML definitions
-function getBatchStepNames(): Set<string> {
-  try {
-    const configDir = getConfigDir();
-    const workflows = loadAllWorkflows(configDir);
-    const batchWorkflow = workflows.get('batch-analysis');
-    if (batchWorkflow) {
-      const names = new Set<string>();
-      for (const step of batchWorkflow.steps) {
-        if (step.phase === 'batch' || step.phase === 'initialization') {
-          names.add(step.name);
-          if (step.substeps) {
-            step.substeps.forEach(sub => names.add(sub));
-          }
-        }
-      }
-      return names;
-    }
-  } catch {
-    // Fall back to empty set if YAML loading fails
-  }
-  return new Set();
-}
-// Lazy-initialize once
-let _batchSteps: Set<string> | null = null;
-function BATCH_STEPS(): Set<string> {
-  if (!_batchSteps) _batchSteps = getBatchStepNames();
-  return _batchSteps;
-}
-
 interface WorkflowConfig {
   workflowId: string;
   workflowName: string;
@@ -189,84 +160,6 @@ interface WorkflowConfig {
   pidFile: string;
 }
 
-
-/**
- * Update step timing statistics after workflow completion
- * This enables learned progress estimation for future runs
- */
-async function updateTimingStatistics(
-  repositoryPath: string,
-  workflowName: string,
-  totalBatches: number
-): Promise<void> {
-  try {
-    const progressPath = path.join(repositoryPath, '.data/workflow-progress.json');
-    if (!fs.existsSync(progressPath)) {
-      log('[WorkflowRunner] Progress file not found for statistics update', 'warning');
-      return;
-    }
-
-    const progressData = JSON.parse(fs.readFileSync(progressPath, 'utf-8'));
-    const stepsDetail = progressData.stepsDetail || [];
-
-    // Calculate batch phase duration (sum of batch step durations)
-    let batchDurationMs = 0;
-    let finalizationDurationMs = 0;
-    const stepDurations: Record<string, number> = {};
-
-    for (const step of stepsDetail) {
-      const duration = step.duration || 0;
-      stepDurations[step.name] = duration;
-
-      if (BATCH_STEPS().has(step.name)) {
-        batchDurationMs += duration;
-      } else {
-        finalizationDurationMs += duration;
-      }
-    }
-
-    // Also process batch iterations if available
-    const batchIterations = progressData.batchIterations || [];
-    if (batchIterations.length > 0) {
-      // Sum up all batch iteration durations
-      batchDurationMs = 0;
-      for (const batch of batchIterations) {
-        for (const step of batch.steps || []) {
-          batchDurationMs += step.duration || 0;
-        }
-      }
-    }
-
-    // Call the statistics update API
-    const apiUrl = 'http://localhost:3033/api/workflows/statistics/update';
-    const response = await fetch(apiUrl, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({
-        workflowName,
-        batchDurationMs,
-        finalizationDurationMs,
-        totalBatches: totalBatches || batchIterations.length || 1,
-        stepDurations
-      })
-    });
-
-    if (response.ok) {
-      const result = await response.json();
-      log('[WorkflowRunner] Timing statistics updated', 'info', {
-        sampleCount: result.data?.sampleCount,
-        avgBatchDurationMs: result.data?.avgBatchDurationMs
-      });
-    } else {
-      log('[WorkflowRunner] Failed to update timing statistics', 'warning', {
-        status: response.status
-      });
-    }
-  } catch (error) {
-    // Non-fatal error - statistics update failure shouldn't break workflow completion
-    log('[WorkflowRunner] Error updating timing statistics', 'warning', error);
-  }
-}
 
 /**
  * Log memory usage to console (goes to log file)
@@ -323,218 +216,74 @@ async function main(): Promise<void> {
     parameters
   });
 
-  // Register progress file subscriber -- writes WorkflowState to disk on every transition
-  const unsubscribeProgressFile = subscribe(createProgressFileSubscriber(progressFile));
-
-  // Read debug settings from progress file if they were pre-set by tools.ts.
-  // Hoisted out of the try below: the wave-analysis branch forwards the same
-  // resolved config to run-wave-analysis, so `ukb debug` keeps its behaviour
-  // on both paths.
+  // Read debug settings from progress file if they were pre-set by tools.ts,
+  // and forward them to whichever run function owns this workflow — both own
+  // the state machine and the progress file from here on.
   let presetConfig: Record<string, any> = {};
   if (fs.existsSync(progressFile)) {
     try {
       presetConfig = JSON.parse(fs.readFileSync(progressFile, 'utf-8'));
     } catch { /* ignore */ }
   }
+  const runConfig = {
+    singleStepMode: presetConfig.singleStepMode || parameters?.singleStepMode || false,
+    mockLLM: presetConfig.mockLLM || parameters?.mockLLM || false,
+    mockLLMDelay: presetConfig.mockLLMDelay,
+    llmMode: presetConfig.llmState?.globalMode || parameters?.llmMode || 'public',
+    stepIntoSubsteps: presetConfig.stepIntoSubsteps || parameters?.stepIntoSubsteps || false,
+  };
 
-  // Dispatch start event to the runner's state machine instance
-  try {
-    dispatch({
-      type: 'start',
-      config: {
-        singleStepMode: presetConfig.singleStepMode || parameters?.singleStepMode || false,
-        mockLLM: presetConfig.mockLLM || parameters?.mockLLM || false,
-        llmMode: presetConfig.llmState?.globalMode || parameters?.llmMode || 'public',
-        stepIntoSubsteps: presetConfig.stepIntoSubsteps || parameters?.stepIntoSubsteps || false,
-      },
-      workflowName,
-      firstStep: workflowName === 'wave-analysis' ? 'wave1_init' : 'initializing',
-    });
-  } catch (err) {
-    // Reset and retry if state machine is in unexpected state (e.g., leftover from previous crash)
-    if (err instanceof InvalidTransitionError) {
-      log(`[WorkflowRunner] State machine in unexpected state, resetting: ${err.message}`, 'warning');
-      reset();
-      dispatch({
-        type: 'start',
-        config: {
-          singleStepMode: parameters?.singleStepMode || false,
-          mockLLM: parameters?.mockLLM || false,
-          llmMode: parameters?.llmMode || 'public',
-          stepIntoSubsteps: parameters?.stepIntoSubsteps || false,
-        },
-        workflowName,
-        firstStep: workflowName === 'wave-analysis' ? 'wave1_init' : 'initializing',
-      });
-    } else {
-      throw err;
-    }
-  }
+  const removeRunFiles = () => {
+    try { fs.unlinkSync(pidFile); } catch (e) { /* ignore */ }
+    try { fs.unlinkSync(configPath); } catch (e) { /* ignore */ }
+  };
 
   // Wave-analysis routing -- separate from coordinator path.
   //
-  // The run itself lives in run-wave-analysis.ts because obs-api runs the same
-  // workflow in-process (km-core's LevelDB is single-owner, so a run spawned
-  // out here cannot open it while obs-api holds the lock). This path keeps
-  // working wherever nothing else owns the store — it just passes no kmStore,
-  // so WaveController opens a private one exactly as before.
+  // Both runs live in their own modules (run-wave-analysis.ts,
+  // run-coordinator-workflow.ts) because obs-api runs the same workflows
+  // in-process: km-core's LevelDB is single-owner, so a run spawned out here
+  // cannot open it while obs-api holds the lock. This path keeps working
+  // wherever nothing else owns the store — it just passes no kmStore, so a
+  // private store is opened exactly as before.
   if (workflowName === 'wave-analysis') {
     const { runWaveAnalysis } = await import('./run-wave-analysis.js');
 
-    // run-wave-analysis owns the state machine and the terminal write, so the
-    // runner's own progress subscriber must stand down first or the two would
-    // both write the terminal state.
-    unsubscribeProgressFile();
-
     const result = await runWaveAnalysis({
       repositoryPath,
-      team: parameters?.team || 'coding',
+      // Strict: this becomes the wave adapter's team, i.e. the tenant stamped
+      // on every entity the run writes.
+      team: parameters?.team ?? (await requireTenant(repositoryPath)),
       progressFile,
-      // Carry the debug config the runner already resolved, so `ukb debug`
-      // still single-steps and mocks on this path.
-      config: {
-        singleStepMode: presetConfig.singleStepMode || parameters?.singleStepMode || false,
-        mockLLM: presetConfig.mockLLM || parameters?.mockLLM || false,
-        llmMode: presetConfig.llmState?.globalMode || parameters?.llmMode || 'public',
-        stepIntoSubsteps: presetConfig.stepIntoSubsteps || parameters?.stepIntoSubsteps || false,
-      },
+      config: runConfig,
     });
 
-    try { fs.unlinkSync(pidFile); } catch (e) { /* ignore */ }
-    try { fs.unlinkSync(configPath); } catch (e) { /* ignore */ }
+    removeRunFiles();
     process.exit(result.success ? 0 : 1);
   }
 
-  const coordinator = new CoordinatorAgent(repositoryPath);
-  cleanupState.coordinator = coordinator;
+  const result = await runCoordinatorWorkflow({
+    repositoryPath,
+    workflowName,
+    team: parameters?.team,
+    parameters,
+    progressFile,
+    config: runConfig,
+    onCoordinator: (coordinator) => { cleanupState.coordinator = coordinator; },
+    // A spawned runner can simply die; the signal-handler cleanup does the rest.
+    onTimeout: (reason) => { gracefulCleanup(reason, 1); },
+  });
 
-  try {
-    // Map workflow names
-    const workflowMapping: Record<string, { target: string; defaults: Record<string, any> }> = {
-      'complete-analysis': {
-        target: 'batch-analysis',
-        // fullAnalysis: process ALL commits; forceCleanStart: clear old checkpoints
-        // resumeFromCheckpoint: resume if crashes mid-run (new checkpoints created per batch)
-        defaults: { fullAnalysis: true, forceCleanStart: true, resumeFromCheckpoint: true }
-      },
-      'incremental-analysis': {
-        target: 'batch-analysis',
-        // Fresh start each time - incremental means "since last analysis timestamp", not "resume crashed workflow"
-        defaults: { fullAnalysis: false, forceCleanStart: true, resumeFromCheckpoint: true }
-      },
-      'batch-analysis': {
-        target: 'batch-analysis',
-        // Fresh start by default - use complete-analysis for crash recovery behavior
-        defaults: { forceCleanStart: true, resumeFromCheckpoint: true }
-      }
-    };
+  log(`[WorkflowRunner] Workflow finished: ${result.status}`, 'info', {
+    duration: `${Math.round((Date.now() - startTime.getTime()) / 1000)}s`,
+    steps: result.steps,
+    error: result.error,
+  });
 
-    const mapping = workflowMapping[workflowName];
-    const resolvedWorkflowName = mapping?.target || workflowName;
-    const resolvedParameters = mapping ? { ...mapping.defaults, ...parameters } : parameters;
-
-    // Get workflow info
-    const workflows = coordinator.getWorkflows();
-    const workflow = workflows.find(w => w.name === resolvedWorkflowName);
-    const isBatchWorkflow = workflow?.type === 'iterative' || resolvedWorkflowName === 'batch-analysis';
-
-    // Heartbeat removed -- subscriber writes on every transition, and coordinator
-    // transitions serve as natural heartbeats. No separate interval needed.
-
-    // Start watchdog timer to prevent indefinite hangs
-    const MAX_WORKFLOW_DURATION_MS = loadWorkflowRunnerConfig().runner.max_duration_ms;
-    const watchdogTimer = setTimeout(() => {
-      log('[WorkflowRunner] Watchdog timeout - workflow exceeded max duration', 'error');
-      gracefulCleanup(`Watchdog timeout: workflow exceeded ${MAX_WORKFLOW_DURATION_MS / 1000 / 60} minutes`, 1);
-    }, MAX_WORKFLOW_DURATION_MS);
-    cleanupState.watchdogTimer = watchdogTimer;
-
-    // Execute the workflow
-    log(`[WorkflowRunner] Executing ${resolvedWorkflowName} (batch: ${isBatchWorkflow})`, 'info');
-
-    let execution;
-    try {
-      execution = isBatchWorkflow
-        ? await coordinator.executeBatchWorkflow(resolvedWorkflowName, resolvedParameters)
-        : await coordinator.executeWorkflow(resolvedWorkflowName, resolvedParameters);
-    } finally {
-      clearTimeout(watchdogTimer);
-    }
-
-    // Dispatch complete/fail event via state machine
-    if (execution.status === 'completed') {
-      try {
-        dispatch({
-          type: 'complete',
-          summary: {
-            steps: `${execution.currentStep}/${execution.totalSteps}`,
-            message: `Workflow ${execution.status}`,
-          },
-        });
-      } catch (err) {
-        if (!(err instanceof InvalidTransitionError)) throw err;
-      }
-    } else {
-      try {
-        dispatch({
-          type: 'fail',
-          error: `Workflow ${execution.status}`,
-          step: String(execution.currentStep),
-        });
-      } catch (err) {
-        if (!(err instanceof InvalidTransitionError)) throw err;
-      }
-    }
-
-    log(`[WorkflowRunner] Workflow completed: ${execution.status}`, 'info', {
-      duration: `${Math.round((Date.now() - startTime.getTime()) / 1000)}s`,
-      steps: `${execution.currentStep}/${execution.totalSteps}`
-    });
-
-    // Update timing statistics for learned progress estimation
-    if (execution.status === 'completed') {
-      const totalBatches = (execution as any).batchIterations?.length ||
-                          parameters?.totalBatches || 1;
-      await updateTimingStatistics(repositoryPath, resolvedWorkflowName, totalBatches);
-    }
-
-  } catch (error) {
-    const errorMessage = error instanceof Error ? error.message : String(error);
-
-    // Dispatch fail event via state machine
-    try {
-      dispatch({ type: 'fail', error: errorMessage, step: 'unknown' });
-    } catch (err) {
-      if (!(err instanceof InvalidTransitionError)) throw err;
-    }
-
-    log(`[WorkflowRunner] Workflow failed: ${errorMessage}`, 'error', error);
-    process.exit(1);
-
-  } finally {
-    // Unsubscribe progress file subscriber to prevent leaks
-    unsubscribeProgressFile();
-
-    try {
-      await coordinator.shutdown();
-    } catch (e) {
-      log('[WorkflowRunner] Error during shutdown', 'error', e);
-    }
-
-    // Clean up PID file
-    try {
-      fs.unlinkSync(pidFile);
-    } catch (e) {
-      // Ignore
-    }
-
-    // Clean up config file
-    try {
-      fs.unlinkSync(configPath);
-    } catch (e) {
-      // Ignore
-    }
-  }
+  // runCoordinatorWorkflow already shut the coordinator down.
+  cleanupState.coordinator = undefined;
+  removeRunFiles();
+  if (!result.success) process.exit(1);
 }
 
 // Run main

@@ -30,12 +30,14 @@ import * as path from 'path';
 
 import {
   dispatch,
+  getState,
   reset,
   subscribe,
   createProgressFileSubscriber,
   InvalidTransitionError,
 } from './workflow-state-machine.js';
 import { writeTerminalState } from './workflow-runner-terminal-write.js';
+import { writeRunConfig, type RunConfig } from './run-config.js';
 
 export interface RunWaveAnalysisOptions {
   /** Absolute path to the repository being analyzed. */
@@ -51,18 +53,14 @@ export interface RunWaveAnalysisOptions {
    */
   kmStore?: object;
   /**
-   * Debug/mock configuration for the run's state-machine `start` event.
+   * Debug/mock configuration the run starts with. Defaults to a production run.
    *
-   * Defaults to a production run. workflow-runner passes what it resolved from
-   * the progress file so `ukb debug` keeps working; obs-api omits it, because
-   * an HTTP-triggered run is always a production one.
+   * workflow-runner passes what it resolved from the progress file; obs-api
+   * passes what the caller sent in the POST body, so `ukb debug` single-steps
+   * and mocks on the in-process path too. (It used to be omitted there, which
+   * silently ran every `ukb debug` as a production run with real LLM calls.)
    */
-  config?: {
-    singleStepMode?: boolean;
-    mockLLM?: boolean;
-    llmMode?: 'mock' | 'local' | 'public';
-    stepIntoSubsteps?: boolean;
-  };
+  config?: RunConfig;
   /** Optional line logger; defaults to stderr. */
   logLine?: (message: string) => void;
 }
@@ -202,6 +200,9 @@ export async function runWaveAnalysis(
   // terminal state that would make `start` an invalid transition).
   reset();
 
+  // Before subscribing: the subscriber lets the file's debug fields win.
+  writeRunConfig(progressFile, opts.config);
+
   const unsubscribe = subscribe(createProgressFileSubscriber(progressFile));
 
   try {
@@ -210,7 +211,7 @@ export async function runWaveAnalysis(
       config: {
         singleStepMode: opts.config?.singleStepMode ?? false,
         mockLLM: opts.config?.mockLLM ?? false,
-        llmMode: opts.config?.llmMode ?? 'public',
+        llmMode: opts.config?.mockLLM ? 'mock' : (opts.config?.llmMode ?? 'public'),
         stepIntoSubsteps: opts.config?.stepIntoSubsteps ?? false,
       },
       workflowName: 'wave-analysis',
@@ -234,6 +235,15 @@ export async function runWaveAnalysis(
     });
 
     const result = await controller.execute();
+
+    // Cancelled from outside (obs-api's /api/workflows/cancel). The state
+    // machine is already terminal, so the fail dispatch below would be
+    // swallowed and the forced write would relabel the run 'failed'.
+    if (getState().status === 'cancelled') {
+      unsubscribe();
+      writeTerminalState(progressFile, 'cancelled');
+      return { success: false, totalEntities: result.totalEntities, waves: result.waves.length, error: 'cancelled' };
+    }
 
     // Snapshot the progress file while stepsDetail is still on it — the
     // terminal write below drops everything outside its allowlist.
