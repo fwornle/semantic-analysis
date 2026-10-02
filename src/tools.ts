@@ -16,7 +16,7 @@ import { CodeGraphAgent } from "./agents/code-graph-agent.js";
 // km-core adapter (Phase 42-01 strangler surface).
 import { createKmCoreAdapter, type KmCoreAdapter } from "./storage/km-core-adapter.js";
 import { acquireKmStore, type AcquiredStore } from "./storage/km-store-host.js";
-import { requireTenant } from "./scope.js";
+import { requireTenant, scopeResolver } from "./scope.js";
 import { repositoryRoot } from "./data-paths.js";
 import { cleanupEntityFiles as cleanupEntityFilesViaAdapter } from "./storage/legacy-consumer-helpers.js";
 import {
@@ -2485,7 +2485,16 @@ end note
  * Allows resetting the incremental analysis marker to re-analyze from a specific point
  */
 async function handleResetAnalysisCheckpoint(args: any): Promise<any> {
-  const { timestamp, days_ago, team = 'coding' } = args;
+  // Lenient, and undefined-defaulted rather than resolved in the destructure.
+  // This team only names a CHECKPOINT FILE under var/ — machine-local churn, not
+  // knowledge — so the placeholder is a perfectly good filename and a strict
+  // resolve here would refuse a harmless maintenance operation.
+  //
+  // One-time effect of the change: the checkpoint moves from `coding` to the
+  // resolved scope, so the next analysis run re-analyses from the beginning.
+  // That is what this tool does on purpose anyway.
+  const { timestamp, days_ago } = args;
+  const team = args.team ?? (await scopeResolver()).resolveScope();
 
   log(`Resetting analysis checkpoint for team: ${team}`, "info", { timestamp, days_ago });
 

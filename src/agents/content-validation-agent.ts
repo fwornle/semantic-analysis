@@ -26,6 +26,7 @@ import { GitHistoryAgent } from "./git-history-agent.js";
 import { VibeHistoryAgent } from "./vibe-history-agent.js";
 import { GitStalenessDetector, CommitEntityCorrelation } from "./git-staleness-detector.js";
 import { log as centralLog } from "../logging.js";
+import { requireTenant, tenantFilter } from "../scope.js";
 
 // Simple logger wrapper for content validation
 const log = (message: string, level: string = "info", data?: any) => {
@@ -174,7 +175,7 @@ export class ContentValidationAgent {
   private gitStalenessDetector: GitStalenessDetector | null = null;
   private useGitBasedDetection: boolean;
   private parallelWorkers: number;
-  private team: string;
+  private team: string | undefined;
 
   // Cached git commits for batch validation (prevents re-fetching per entity)
   private cachedGitCommits: any[] | null = null;
@@ -216,7 +217,16 @@ export class ContentValidationAgent {
     // Increased from 1 to 10 to better utilize parallelization for validation
     this.parallelWorkers = Math.min(Math.max(config?.parallelWorkers ?? 10, 1), 20);
     // Team: derive from repository path basename if not provided
-    this.team = config?.team || path.basename(this.repositoryPath);
+    // Only what the caller named. It used to be
+    // `config?.team || path.basename(this.repositoryPath)` — the
+    // basename-as-tenant guess lib/scope exists to replace, which made the tenant
+    // a property of whatever directory the agent was pointed at, so a checkout
+    // called `coding-history` or `decoding` became its own tenant.
+    //
+    // Resolution happens in tenant() / tenantForRead(): the resolver is reached
+    // through an async bridge, and a constructor must not throw for callers that
+    // only read.
+    this.team = config?.team;
     this.semanticAnalyzer = new SemanticAnalyzer();
 
     // Initialize GitStalenessDetector for git-based staleness detection
@@ -277,7 +287,11 @@ export class ContentValidationAgent {
    */
   async detectEntityGitStaleness(
     entity: { name: string; entityType?: string; observations?: any[]; metadata?: any },
-    team: string,
+    // Accepted for signature compatibility and never read — staleness is decided
+    // from git history, not from tenancy. `undefined` is allowed because callers
+    // on a read path have no tenant when the installation has no scope, and
+    // inventing one there would be the bug this parameter cannot even cause.
+    team: string | undefined,
     prefetchedCommits?: any[] // Optional pre-fetched commits to avoid per-entity git calls
   ): Promise<{
     isStale: boolean;
@@ -388,6 +402,22 @@ export class ContentValidationAgent {
   }
 
   /**
+   * The tenant to WRITE a refreshed entity with. Throws when none is configured,
+   * because the tenant stamped on an entity is permanent.
+   */
+  private async tenant(): Promise<string> {
+    return this.team ?? requireTenant(this.repositoryPath);
+  }
+
+  /**
+   * The tenant to FILTER by, or undefined for "every tenant". Never the
+   * placeholder: a filter of `default` returns nothing and reads as data loss.
+   */
+  private async tenantForRead(): Promise<string | undefined> {
+    return this.team ?? tenantFilter(this.repositoryPath);
+  }
+
+  /**
    * Validate all entities in the graph database for staleness
    * Called during incremental-analysis workflow to detect outdated entities
    */
@@ -435,7 +465,7 @@ export class ContentValidationAgent {
         log(`Checking ${entities.length} entities for staleness via git-based detection`, 'info');
       }
 
-      const team = this.team;
+      const team = await this.tenantForRead();
 
       // OPTIMIZATION: Pre-fetch git commits ONCE for all entities (major performance improvement)
       let prefetchedCommits: any[] = [];
@@ -1338,7 +1368,10 @@ export class ContentValidationAgent {
 
   // ==================== Private Helper Methods ====================
 
-  private async loadEntity(entityName: string, team: string): Promise<any> {
+  // `team` may be undefined on an unscoped installation: it is only a fallback
+  // for an entity whose own metadata carries no tenant, and carrying undefined
+  // through is honest where substituting one would not be.
+  private async loadEntity(entityName: string, team: string | undefined): Promise<any> {
     // First try to load from graph database if available
     if (this.graphDB && this.graphDB.initialized) {
       try {
@@ -3029,7 +3062,7 @@ Respond with a JSON array:
       } catch (error) {
         // Fallback: try loading from shared memory export
         log('GraphDB query failed, trying shared memory fallback', 'warning', error);
-        const entity = await this.loadEntity('*', params.team || 'coding');
+        const entity = await this.loadEntity('*', params.team || (await this.tenantForRead()));
         if (entity) {
           entities = [entity];
         }
@@ -3047,7 +3080,7 @@ Respond with a JSON array:
       for (const entity of entities) {
         // Handle different field names from legacy storage (entity_name) vs normalized (name)
         const entityName = entity.name || entity.entityName || entity.entity_name;
-        const entityTeam = entity.team || params.team || 'coding';
+        const entityTeam = entity.team || params.team || (await this.tenant());
 
         if (!entityName) {
           log(`Entity missing name field, skipping`, 'warning', { entity: JSON.stringify(entity).substring(0, 200) });
@@ -3100,7 +3133,7 @@ Respond with a JSON array:
       const processEntity = async (item: { entity: any; validationReport: EntityValidationReport }): Promise<EntityRefreshResult> => {
         const { entity, validationReport } = item;
         const entityName = entity.name || entity.entityName || entity.entity_name;
-        const entityTeam = entity.team || params.team || 'coding';
+        const entityTeam = entity.team || params.team || (await this.tenant());
 
         try {
           const refreshResult = await this.refreshStaleEntity({
