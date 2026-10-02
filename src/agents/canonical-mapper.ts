@@ -177,9 +177,9 @@ export function toCanonicalEntity(
     baseMetadata.team = options.team;
   }
 
-  // Phase 57 D-04 — stamp the closed-set `metadata.project` tag for every
-  // canonical entity. Uses `isProject()` from km-core as the runtime
-  // typeguard (D-03) — closed-set vocabulary, NOT a `length > 0` string
+  // Phase 57 D-04 — stamp the `metadata.project` tag for every canonical
+  // entity. Uses `isProject()` from km-core as the runtime typeguard (D-03)
+  // — a well-formed, non-placeholder tenant id, NOT a `length > 0` string
   // check. The legacy `metadata.team` stamp above is preserved verbatim
   // (D-02 — Phase 57 adds project NEXT TO team, never instead of it).
   // Defence-in-depth dual-stamp at km-core-adapter.ts:storeEntity mirrors
