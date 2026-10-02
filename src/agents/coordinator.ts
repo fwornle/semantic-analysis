@@ -19,6 +19,7 @@ import { HierarchyClassifierAgent } from "./hierarchy-classifier.js";
 // rewired to the km-core adapter (Phase 42-01 strangler surface).
 import { createKmCoreAdapter, type KmCoreAdapter } from "../storage/km-core-adapter.js";
 import { acquireKmStore, type AcquiredStore } from "../storage/km-store-host.js";
+import { getState as getWorkflowState } from "../workflow-state-machine.js";
 import { requireTenant, tenantFilter } from "../scope.js";
 import {
   saveSuccessfulWorkflowCompletion as saveCompletionMarker,
@@ -348,6 +349,10 @@ export class CoordinatorAgent {
    */
   private team: string | undefined;
   private acquiredStore: AcquiredStore | null = null;
+  // A store the CALLER owns and keeps open — obs-api's, when a batch workflow
+  // runs inside the process that holds km-core's single-owner LevelDB lock.
+  // Borrowed, so shutdown()'s release() leaves it open.
+  private injectedKmStore: object | undefined;
   // Phase 42.2 Plan 04 — km-core adapter replaces the legacy GraphDatabaseAdapter.
   // Constructed lazily inside doInitializeAgents() so we can use the same
   // GraphKMStore bootstrap path as wave-controller.ts (matching dbPath +
@@ -365,9 +370,10 @@ export class CoordinatorAgent {
   // instead would make construction throw on an unscoped machine, including on
   // read-only paths. So it stays undefined and `tenant()` decides, at the one
   // moment the answer gets written down.
-  constructor(repositoryPath: string = '.', team?: string) {
+  constructor(repositoryPath: string = '.', team?: string, opts: { kmStore?: object } = {}) {
     this.repositoryPath = repositoryPath;
     this.team = team;
+    this.injectedKmStore = opts.kmStore;
     // Phase 42.2 Plan 04 — km-core adapter bootstrapped lazily during
     // doInitializeAgents() so we can `await store.open()` (which the
     // constructor cannot do synchronously). this.adapter starts null and
@@ -864,6 +870,19 @@ export class CoordinatorAgent {
    * Reads the progress file and checks for 'cancelled' status
    */
   private isWorkflowCancelled(): boolean {
+    // The state machine in THIS process is what obs-api's /api/workflows/cancel
+    // dispatches into, and it is the only cancel an in-process run can see.
+    //
+    // The file check below has never fired on its own: it reads the
+    // coordinator's OWN legacy progress file, which nothing writes 'cancelled'
+    // into — the dashboard cancels workflow-progress.json. A spawned runner was
+    // only ever stopped by having its PID killed, which is not an option for a
+    // run inside obs-api: before this check, a cancelled in-process batch run
+    // kept going to the end.
+    if (getWorkflowState().status === 'cancelled') {
+      log('Workflow cancellation detected from the workflow state machine', 'info');
+      return true;
+    }
     try {
       const progressPath = `${this.repositoryPath}/.data/workflow-progress-legacy.json`;
       if (fs.existsSync(progressPath)) {
@@ -1837,22 +1856,18 @@ export class CoordinatorAgent {
       // construction path at lines ~510-525 — same dbPath / ontologyDir /
       // exportDir / domains, so both readers see the same canonical store.
       try {
-        // KNOWN CONSEQUENCE, accepted deliberately. This used to address
-        // `.data/knowledge-graph-migrated/`, which exists nowhere — so a
-        // workflow run here wrote into a store nothing reads and never
-        // contended with anyone. Now it addresses the canonical LevelDB, which
-        // is single-owner-rw.
-        //
-        // workflow-runner.ts spawns this agent in a DETACHED child, and a child
-        // cannot take the lock while obs-api holds it. So batch-analysis /
-        // incremental-analysis / complete-analysis now FAIL here, loudly, where
-        // they previously "succeeded" into a void. That is the same trade
-        // wave-analysis already made (see tools.ts: "Fail here, naming the
-        // cause"); the fix for those three is to hand them to obs-api over HTTP
-        // the way wave-analysis is handed over.
+        // This addresses the canonical LevelDB, which is single-owner-rw (it
+        // used to address `.data/knowledge-graph-migrated/`, which exists
+        // nowhere, so runs "succeeded" into a void). A detached child cannot
+        // take the lock while obs-api holds it, so tools.ts hands
+        // batch-analysis / incremental-analysis / complete-analysis to obs-api
+        // over HTTP, and obs-api passes its open store in as `kmStore` — see
+        // run-coordinator-workflow.ts. Without one, a private store is opened,
+        // which still works wherever nothing else owns the lock.
         const acquired = await acquireKmStore({
           repositoryPath: this.repositoryPath,
           team: await this.tenant(),
+          injected: this.injectedKmStore,
         });
         this.adapter = acquired.adapter;
         this.acquiredStore = acquired;

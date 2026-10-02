@@ -16,7 +16,7 @@ import { CodeGraphAgent } from "./agents/code-graph-agent.js";
 // km-core adapter (Phase 42-01 strangler surface).
 import { createKmCoreAdapter, type KmCoreAdapter } from "./storage/km-core-adapter.js";
 import { acquireKmStore, type AcquiredStore } from "./storage/km-store-host.js";
-import { requireTenant } from "./scope.js";
+import { requireTenant, scopeResolver } from "./scope.js";
 import { repositoryRoot } from "./data-paths.js";
 import { cleanupEntityFiles as cleanupEntityFilesViaAdapter } from "./storage/legacy-consumer-helpers.js";
 import {
@@ -84,6 +84,14 @@ function sendProgressUpdate(workflowId: string, message: string, data?: Record<s
     }
   }
 }
+
+/**
+ * Workflows that run inside obs-api, the km-core store's owner, rather than in
+ * a spawned workflow-runner. Must match obs-api's WORKFLOW_RUNNERS
+ * (scripts/observations-api-server.mjs); tests/ukb/wave-analysis-single-owner
+ * holds the two together.
+ */
+const OBS_API_WORKFLOWS = new Set(['wave-analysis', 'batch-analysis', 'incremental-analysis', 'complete-analysis']);
 
 /**
  * Clean up any existing running workflows before starting a new one.
@@ -1093,6 +1101,106 @@ async function handleExecuteWorkflow(args: any): Promise<any> {
     // DEBUG: Trace path resolution
     appendFileSync('/tmp/tools-debug.log', `[${new Date().toISOString()}] async_mode: CODING_ROOT=${process.env.CODING_ROOT}, repositoryPath=${repositoryPath}, effectiveRepoPath=${effectiveRepoPath}\n`);
 
+    // ── The UKB workflows run in obs-api, not in a spawned child ───────────
+    //
+    // km-core's LevelDB is single-owner-rw and obs-api owns it for the life of
+    // that process. A child spawned from here cannot open it: every
+    // wave-analysis run after the Plan 44-12 cutover (2026-06-04) exited 1 one
+    // second in with "Database failed to open", and batch-, incremental- and
+    // complete-analysis joined it once CoordinatorAgent was pointed at the
+    // canonical store. Hand the run to the owner over HTTP instead — it
+    // executes the same run-wave-analysis.ts / run-coordinator-workflow.ts
+    // against its own open store and writes the same progress file, so the
+    // dashboard, the status tool and the [📚] badge all see an unchanged shape.
+    //
+    // This happens BEFORE the cleanup, the debug pre-write and the local start
+    // dispatch below, and touches none of them: obs-api may refuse (409, a
+    // different workflow holds its lock), and a refused request must not
+    // cancel or reconfigure the run it was refused for. The run writes its
+    // own debug settings once obs-api has accepted it.
+    //
+    // Deliberately NOT falling back to the spawn path when obs-api is
+    // unreachable: that fallback is precisely the run that fails a second later
+    // with an error naming the database rather than the daemon, which is what
+    // made this take three months to notice. Fail here, naming the cause.
+    if (OBS_API_WORKFLOWS.has(workflow_name)) {
+      const obsApiUrl = process.env.OBS_API_URL || 'http://host.docker.internal:12436';
+      const runUrl = `${obsApiUrl}/api/workflows/${workflow_name}/run`;
+      const notStarted = (reason: string[]) => ({
+        content: [{ type: 'text' as const, text: ['# Workflow NOT started', '', ...reason].join('\n') }],
+        isError: true,
+      });
+      try {
+        // The caller's own parameters, not resolvedParameters: obs-api applies
+        // each workflow's defaults itself, and its repository is its own root
+        // (a path from here names the container's mount, not the host's).
+        const { repository_path: _rp, repositoryPath: _rp2, ...callerParameters } = parameters || {};
+        const resp = await fetch(runUrl, {
+          method: 'POST',
+          headers: { 'content-type': 'application/json' },
+          body: JSON.stringify({
+            // Strict: obs-api turns this into the run's tenant, so it is the
+            // tenant every entity the run writes gets stamped with.
+            team: resolvedParameters?.team ?? (await requireTenant()),
+            parameters: callerParameters,
+            config: {
+              singleStepMode: wantsSingleStep,
+              mockLLM: wantsMockLLM,
+              mockLLMDelay: resolvedParameters?.mockLLMDelay,
+              stepIntoSubsteps: wantsStepIntoSubsteps,
+            },
+          }),
+          signal: AbortSignal.timeout(10_000),
+        });
+        if (resp.status === 409) {
+          const body = await resp.json().catch(() => ({})) as { error?: string };
+          log(`${workflow_name} refused by obs-api: another workflow is running`, 'warning', { runUrl, error: body.error });
+          return notStarted([
+            body.error ?? `obs-api refused ${workflow_name}: another workflow is running.`,
+            '',
+            'Wait for it to finish (`semantic workflow status`), or cancel it, then retry.',
+          ]);
+        }
+        if (!resp.ok) {
+          throw new Error(`obs-api returned HTTP ${resp.status}`);
+        }
+        const body = await resp.json() as { jobId?: number; attached?: boolean };
+        log(`${workflow_name} dispatched to obs-api (in-process on the owned store)`, 'info', {
+          runUrl, jobId: body.jobId, attached: body.attached,
+        });
+        return {
+          content: [{
+            type: 'text' as const,
+            text: [
+              '# Workflow Started (obs-api, in-process)',
+              '',
+              `**Workflow:** ${workflow_name}`,
+              `**Job:** ${body.jobId ?? 'unknown'}${body.attached ? ' (attached to an in-flight run)' : ''}`,
+              `**Host:** ${obsApiUrl}`,
+              '',
+              'Runs inside obs-api because it owns the km-core store.',
+              'Progress: `.data/workflow-progress.json`, `semantic workflow status`,',
+              `or GET /api/workflows/${workflow_name}/status on obs-api.`,
+            ].join('\n'),
+          }],
+        };
+      } catch (e) {
+        const msg = e instanceof Error ? e.message : String(e);
+        log(`${workflow_name} dispatch to obs-api failed`, 'error', { runUrl, error: msg });
+        return notStarted([
+          `Could not reach obs-api at ${runUrl}: ${msg}`,
+          '',
+          `${workflow_name} runs inside obs-api because km-core's LevelDB is`,
+          'single-owner and obs-api holds it. Check the daemon:',
+          '',
+          '```',
+          'launchctl list | grep com.coding.obs-api',
+          'curl -s localhost:12436/health',
+          '```',
+        ]);
+      }
+    }
+
     // CRITICAL: Clean up any existing running workflows before starting a new one
     // This prevents multiple workflows from conflicting on the shared progress file
     // NOTE: Cleanup may overwrite progress file with { status: 'cancelled' }
@@ -1170,78 +1278,6 @@ async function handleExecuteWorkflow(args: any): Promise<any> {
       // If already running, log and continue (cleanup should have cancelled it)
       if (err instanceof InvalidTransitionError) {
         log(`State machine transition warning: ${err.message}`, 'warning');
-      }
-    }
-
-    // ── wave-analysis runs in obs-api, not in a spawned child ──────────────
-    //
-    // km-core's LevelDB is single-owner-rw and obs-api owns it for the life of
-    // that process. A child spawned from here cannot open it: every
-    // wave-analysis run after the Plan 44-12 cutover (2026-06-04) exited 1 one
-    // second in with "Database failed to open". Hand the run to the owner over
-    // HTTP instead — it executes the same run-wave-analysis.ts against its own
-    // open store and writes the same progress file, so the dashboard, the
-    // status tool and the [📚] badge all see an unchanged shape.
-    //
-    // Deliberately NOT falling back to the spawn path when obs-api is
-    // unreachable: that fallback is precisely the run that fails a second later
-    // with an error naming the database rather than the daemon, which is what
-    // made this take three months to notice. Fail here, naming the cause.
-    if (resolvedWorkflowName === 'wave-analysis') {
-      const obsApiUrl = process.env.OBS_API_URL || 'http://host.docker.internal:12436';
-      const runUrl = `${obsApiUrl}/api/workflows/wave-analysis/run`;
-      try {
-        const resp = await fetch(runUrl, {
-          method: 'POST',
-          headers: { 'content-type': 'application/json' },
-          body: JSON.stringify({ team: resolvedParameters?.team || 'coding' }),
-          signal: AbortSignal.timeout(10_000),
-        });
-        if (!resp.ok) {
-          throw new Error(`obs-api returned HTTP ${resp.status}`);
-        }
-        const body = await resp.json() as { jobId?: number; attached?: boolean };
-        log('wave-analysis dispatched to obs-api (in-process on the owned store)', 'info', {
-          runUrl, jobId: body.jobId, attached: body.attached,
-        });
-        return {
-          content: [{
-            type: 'text' as const,
-            text: [
-              '# Workflow Started (obs-api, in-process)',
-              '',
-              `**Workflow:** wave-analysis`,
-              `**Job:** ${body.jobId ?? 'unknown'}${body.attached ? ' (attached to an in-flight run)' : ''}`,
-              `**Host:** ${obsApiUrl}`,
-              '',
-              'Runs inside obs-api because it owns the km-core store.',
-              'Progress: `.data/workflow-progress.json`, `semantic workflow status`,',
-              'or GET /api/workflows/wave-analysis/status on obs-api.',
-            ].join('\n'),
-          }],
-        };
-      } catch (e) {
-        const msg = e instanceof Error ? e.message : String(e);
-        log('wave-analysis dispatch to obs-api failed', 'error', { runUrl, error: msg });
-        return {
-          content: [{
-            type: 'text' as const,
-            text: [
-              '# Workflow NOT started',
-              '',
-              `Could not reach obs-api at ${runUrl}: ${msg}`,
-              '',
-              'wave-analysis runs inside obs-api because km-core\'s LevelDB is',
-              'single-owner and obs-api holds it. Check the daemon:',
-              '',
-              '```',
-              'launchctl list | grep com.coding.obs-api',
-              'curl -s localhost:12436/health',
-              '```',
-            ].join('\n'),
-          }],
-          isError: true,
-        };
       }
     }
 
@@ -2485,7 +2521,16 @@ end note
  * Allows resetting the incremental analysis marker to re-analyze from a specific point
  */
 async function handleResetAnalysisCheckpoint(args: any): Promise<any> {
-  const { timestamp, days_ago, team = 'coding' } = args;
+  // Lenient, and undefined-defaulted rather than resolved in the destructure.
+  // This team only names a CHECKPOINT FILE under var/ — machine-local churn, not
+  // knowledge — so the placeholder is a perfectly good filename and a strict
+  // resolve here would refuse a harmless maintenance operation.
+  //
+  // One-time effect of the change: the checkpoint moves from `coding` to the
+  // resolved scope, so the next analysis run re-analyses from the beginning.
+  // That is what this tool does on purpose anyway.
+  const { timestamp, days_ago } = args;
+  const team = args.team ?? (await scopeResolver()).resolveScope();
 
   log(`Resetting analysis checkpoint for team: ${team}`, "info", { timestamp, days_ago });
 

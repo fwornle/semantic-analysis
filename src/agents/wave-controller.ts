@@ -3474,6 +3474,17 @@ export class WaveController {
     const logIntervalMs = 30_000; // 30 seconds (was 5 min — too long for debugging)
 
     while (true) {
+      // A cancel dispatched into THIS process's state machine (obs-api's
+      // /api/workflows/cancel). Without this check a paused in-process run
+      // could not be stopped at all: the dashboard's cancel rewrites the file,
+      // which clears stepPaused, which this loop reads as "user clicked Step" —
+      // so cancelling a paused run ADVANCED it. Returning lets the caller's
+      // cancelled check at the step boundary end the run.
+      if (getState().status === 'cancelled') {
+        log(`[Step] CANCELLED while paused at '${stepName}'`, 'info');
+        return;
+      }
+
       let currentProgress: Record<string, any>;
       try {
         currentProgress = JSON.parse(fs.readFileSync(this.progressFile, 'utf8'));

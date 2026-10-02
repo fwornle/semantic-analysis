@@ -318,6 +318,16 @@ export class SemanticAnalyzer {
       SemanticAnalyzer.getLLMModeForAgent(agentId || undefined)
     );
 
+    // The mock service and repository path are wired in ensureInitialized(),
+    // NOT here: both setters write into the 'mock' provider, which does not
+    // exist until initialize() has registered providers. Called here they
+    // were silent no-ops, so the mock provider reported itself unavailable and
+    // LLMService fell through mock → local → PUBLIC — every `ukb debug` run
+    // made real, metered calls while logging "intended=mock, actual=public".
+    semanticDebugLog('SemanticAnalyzer constructed with LLMService');
+  }
+
+  private wireMockService(): void {
     // Wire mock service: delegates to existing mockSemanticAnalysis()
     this.llmService.setMockService({
       mockLLMCall: async (agentType: string, prompt: string, repositoryPath: string): Promise<LLMCompletionResult> => {
@@ -338,8 +348,6 @@ export class SemanticAnalyzer {
     });
 
     this.llmService.setRepositoryPath(SemanticAnalyzer.repositoryPath);
-
-    semanticDebugLog('SemanticAnalyzer constructed with LLMService');
   }
 
   /**
@@ -348,6 +356,7 @@ export class SemanticAnalyzer {
   private async ensureInitialized(): Promise<void> {
     if (!this.llmInitialized) {
       await this.llmService.initialize();
+      this.wireMockService();
       this.llmInitialized = true;
       semanticDebugLog('LLMService initialized', {
         providers: this.llmService.getAvailableProviders(),
@@ -444,7 +453,13 @@ export class SemanticAnalyzer {
     // landing in token_usage.db as `process='unknown'`. Phase 52 Task 5
     // acceptance-gate failure (27 unknown rows from wave-4 diagram path)
     // diagnosed this ordering bug.
-    if (typeof processTag === 'string' && processTag.length > 0) {
+    //
+    // NOT in mock mode. This path dials the real proxy and never consults the
+    // mode resolver, so every process-tagged call in a `ukb debug` run was a
+    // real, metered LLM call — logged as "LLM mode fallback: intended=mock,
+    // actual=public", one ~9s call per entity. Mock mode falls through to the
+    // SDK path below, whose mode resolver routes to the mock service.
+    if (llmMode !== 'mock' && typeof processTag === 'string' && processTag.length > 0) {
       try {
         const proxyResult = await llmWithProcessComplete(
           {
