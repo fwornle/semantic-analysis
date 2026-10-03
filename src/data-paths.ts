@@ -111,3 +111,30 @@ export async function dataPaths(repositoryPath?: string): Promise<DataPaths> {
 export function resetDataPathsCache(): void {
   cached = null;
 }
+
+/**
+ * The knowledge-export layout for a store in THIS process (coding
+ * lib/kb/layout.mjs, mode 'local'): hydrate merges every project's export —
+ * each repo's learning checkout, teammates' shared clones, the local files —
+ * and writes stay in the data home's `exports/general.json`, as before. Only
+ * obs-api (the 'owner') writes into repos; the container could not anyway,
+ * /workspace is mounted read-only.
+ *
+ * Reading everything is the point: a store that never saw the owner's
+ * tombstones would keep re-exporting what the owner deleted, and a UKB run
+ * would not see what a teammate pushed.
+ *
+ * Returns undefined when the module is not there (lib/kb not mounted, an
+ * older checkout): the store then uses km-core's default single-dir layout,
+ * which is what it did before.
+ */
+export async function localKbLayout(repositoryPath?: string): Promise<unknown | undefined> {
+  const root = repositoryRoot(repositoryPath);
+  try {
+    const href = pathToFileURL(path.join(root, 'lib', 'kb', 'layout.mjs')).href;
+    const mod = (await import(href)) as { kbLayout?: (o: object) => unknown };
+    return mod.kbLayout?.({ mode: 'local', codingRoot: root });
+  } catch {
+    return undefined;
+  }
+}

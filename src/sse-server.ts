@@ -10,13 +10,13 @@ import express, { Router } from 'express';
 import type { Request, Response } from 'express';
 import path from 'node:path';
 import { SSEServerTransport } from "@modelcontextprotocol/sdk/server/sse.js";
-import { createKmCoreRouter, GraphKMStore } from '@fwornle/km-core';
+import { createKmCoreRouter, GraphKMStore, type GraphKMStoreOptions } from "@fwornle/km-core";
 import { createServer } from "./server.js";
 import { log, logError } from "./logging.js";
 import { setServerInstance, handleToolCall, TOOLS } from "./tools.js";
 import { createSSEBroadcaster } from "./workflow-sse-broadcaster.js";
 import { subscribe, getState } from "./workflow-state-machine.js";
-import { dataPaths, repositoryRoot } from "./data-paths.js";
+import { dataPaths, localKbLayout, repositoryRoot } from "./data-paths.js";
 import { setKmStoreProvider } from "./storage/km-store-host.js";
 
 const PORT = parseInt(process.env.SEMANTIC_ANALYSIS_PORT || '3848', 10);
@@ -85,6 +85,8 @@ DATA.ensureDataHome();
 const kmStore = new GraphKMStore({
   dbPath: DATA.graphDbDir(),
   exportDir: DATA.graphExportsDir(),
+  // T4: read every project's export (coding lib/kb/layout.mjs, 'local' mode).
+  layout: (await localKbLayout(REPOSITORY_PATH)) as GraphKMStoreOptions['layout'],
   ontologyDir: path.join(REPOSITORY_PATH, '.data', 'ontologies'),
   // No `domains`. It used to say `['coding']`, which was a tenant name in a
   // slot that holds TOPIC names — the only writers of `metadata.domain` set

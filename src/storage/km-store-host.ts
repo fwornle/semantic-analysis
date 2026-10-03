@@ -32,7 +32,7 @@
 
 import path from 'node:path';
 import { createKmCoreAdapter, type KmCoreAdapter } from './km-core-adapter.js';
-import { dataPaths, repositoryRoot } from '../data-paths.js';
+import { dataPaths, localKbLayout, repositoryRoot } from '../data-paths.js';
 
 /**
  * Returns the host's open store, or null while it is still hydrating.
@@ -120,9 +120,11 @@ export async function acquireKmStore(opts: AcquireOptions): Promise<AcquiredStor
   const dbPath = DATA.graphDbDir();
 
   const km = await import('@fwornle/km-core');
+  const layout = (await localKbLayout(root)) as import('@fwornle/km-core').GraphKMStoreOptions['layout'];
   const store = new km.GraphKMStore({
     dbPath,
     exportDir: DATA.graphExportsDir(),
+    layout,
     // The curated dir obs-api opens, so a standalone run and an in-process run
     // see the SAME 61 classes. `.data/ontologies` carries the host upper
     // WITHOUT the LearningArtifact axis, and one database read through two
