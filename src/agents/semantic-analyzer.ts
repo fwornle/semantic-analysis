@@ -4,9 +4,6 @@ import * as path from "path";
 import { fileURLToPath } from "url";
 import { spawn } from "child_process";
 import { isMockLLMEnabled, mockSemanticAnalysis, getLLMMode, type LLMMode } from "../mock/llm-mock-service.js";
-import { LLMService } from "@rapid/llm-proxy";
-import type { LLMCompletionResult, MockServiceInterface } from "@rapid/llm-proxy";
-import { attachTokenLogger } from "../utils/token-usage-logger.js";
 import { llmWithProcessComplete } from "./llm-with-process.js";
 
 // ES module compatible __dirname
@@ -45,23 +42,14 @@ export interface AnalysisOptions {
   tier?: ModelTier;
   taskType?: TaskType;
   /** Phase 42.2 Plan 06 follow-up — per-call timeout in milliseconds.
-   *  Threaded into `llmService.complete()` so the underlying fetch aborts
-   *  via AbortSignal.timeout when the proxy stalls. Without this, the
-   *  insights wave hangs indefinitely on a stalled LLM call (no SDK
-   *  default timeout). Mirrors the 60s default in `llm-with-process.ts`
-   *  used by waves 1-3. */
+   *  Threaded into the proxy call so the underlying fetch aborts
+   *  via AbortSignal.timeout when the proxy stalls. Omitted, it is
+   *  `DEFAULT_TIMEOUT_MS` (120s). */
   timeout?: number;
-  /** Phase 52 D-09 — per-call process tag for token-usage attribution.
-   *  When set, `analyzeContent` strangler-routes the call through
-   *  `llmWithProcessComplete` (the direct-fetch wrapper that sets
-   *  `body.process` on `/api/complete`) so the proxy stores the call
-   *  under the sub-step tag instead of the default 'unknown' bucket.
-   *  When undefined, the existing SDK direct path (`llmService.complete`)
-   *  fires — preserves backward compatibility for orphan callers that
-   *  haven't been migrated yet. Closes the deferred 42.2-06 wave-4
-   *  InsightGenerationAgent unknown gap (the 5 insight-generation call
-   *  sites + the single ontology-classification call site all set this
-   *  field in Phase 52). */
+  /** Phase 52 D-09 — per-call process tag for token-usage attribution and
+   *  routing: the proxy stores the call under this tag and routes it by the
+   *  `bg-<process>` route. Omitted, the call is tagged
+   *  `wave-analysis-sem-analyzer`. */
   process?: string;
   /** Per-call output-token budget, forwarded to `/api/complete`.
    *
@@ -147,6 +135,23 @@ export interface StepLLMMetrics {
   }>;
   fallbackCount: number;
 }
+
+/** One completed call, whichever path (mock or proxy) produced it. */
+interface LLMCompletionResult {
+  content: string;
+  provider: string;
+  model: string;
+  tokens: { input: number; output: number; total: number };
+  mock?: boolean;
+}
+
+/** `process` tag for calls whose caller names none, so the proxy routes them
+ *  by `bg-wave-analysis-sem-analyzer` instead of `defaults.background`. */
+const DEFAULT_PROCESS_TAG = 'wave-analysis-sem-analyzer';
+
+/** Timeout for callers that set none — the 120s the in-process SDK applied
+ *  per provider before this class called the proxy directly. */
+const DEFAULT_TIMEOUT_MS = 120_000;
 
 export class SemanticAnalyzer {
   // Static repository path for mock mode checking
@@ -289,10 +294,6 @@ export class SemanticAnalyzer {
     log(`Recorded external LLM call: ${metrics.provider}/${metrics.model} - ${metrics.totalTokens} tokens`, 'debug');
   }
 
-  // LLM Service instance
-  private llmService: LLMService;
-  private llmInitialized = false;
-
   // PERFORMANCE OPTIMIZATION: Request batching
   private batchQueue: Array<{
     prompt: string;
@@ -306,62 +307,53 @@ export class SemanticAnalyzer {
   ), 50);
   private readonly BATCH_TIMEOUT = 100; // ms
 
-  constructor() {
-    // Create LLM service with mode resolver and mock service wiring
-    this.llmService = new LLMService();
-    // Phase 42 Plan 07 — Surprise #5 fix: CommonJS require() → static ESM import
-    // (pre-existing ESM regression from commit 12fc1f5, predates Phase 42).
-    attachTokenLogger(this.llmService, 'semantic-analyzer');
-
-    // Wire mode resolver: delegates to static getLLMModeForAgent()
-    this.llmService.setModeResolver((agentId) =>
-      SemanticAnalyzer.getLLMModeForAgent(agentId || undefined)
-    );
-
-    // The mock service and repository path are wired in ensureInitialized(),
-    // NOT here: both setters write into the 'mock' provider, which does not
-    // exist until initialize() has registered providers. Called here they
-    // were silent no-ops, so the mock provider reported itself unavailable and
-    // LLMService fell through mock → local → PUBLIC — every `ukb debug` run
-    // made real, metered calls while logging "intended=mock, actual=public".
-    semanticDebugLog('SemanticAnalyzer constructed with LLMService');
-  }
-
-  private wireMockService(): void {
-    // Wire mock service: delegates to existing mockSemanticAnalysis()
-    this.llmService.setMockService({
-      mockLLMCall: async (agentType: string, prompt: string, repositoryPath: string): Promise<LLMCompletionResult> => {
-        const mockResult = await mockSemanticAnalysis(prompt, repositoryPath);
-        return {
-          content: mockResult.content,
-          provider: 'mock',
-          model: 'mock-llm-v1',
-          tokens: {
-            input: mockResult.tokenUsage.inputTokens,
-            output: mockResult.tokenUsage.outputTokens,
-            total: mockResult.tokenUsage.totalTokens,
-          },
-          mock: true,
-          local: true,
-        };
-      },
-    });
-
-    this.llmService.setRepositoryPath(SemanticAnalyzer.repositoryPath);
-  }
-
   /**
-   * Ensure LLM service is initialized
+   * The one place an LLM call leaves this class. Mock mode (`ukb debug`)
+   * answers from the mock service and never dials out; every other mode goes
+   * to the proxy daemon, which picks the model from the `process` route.
+   * 'local' has no in-process meaning any more — the daemon owns local
+   * offload — so it reaches the proxy too and the step records the fallback.
    */
-  private async ensureInitialized(): Promise<void> {
-    if (!this.llmInitialized) {
-      await this.llmService.initialize();
-      this.wireMockService();
-      this.llmInitialized = true;
-      semanticDebugLog('LLMService initialized', {
-        providers: this.llmService.getAvailableProviders(),
-      });
+  private async complete(request: {
+    prompt: string;
+    process?: string;
+    tier?: ModelTier;
+    taskType?: string;
+    timeout?: number;
+    maxTokens?: number;
+  }): Promise<LLMCompletionResult> {
+    if (SemanticAnalyzer.getLLMModeForAgent() === 'mock') {
+      const mockResult = await mockSemanticAnalysis(request.prompt, SemanticAnalyzer.repositoryPath);
+      return {
+        content: mockResult.content,
+        provider: 'mock',
+        model: 'mock-llm-v1',
+        tokens: {
+          input: mockResult.tokenUsage.inputTokens,
+          output: mockResult.tokenUsage.outputTokens,
+          total: mockResult.tokenUsage.totalTokens,
+        },
+        mock: true,
+      };
     }
+
+    const result = await llmWithProcessComplete({
+      process: request.process || DEFAULT_PROCESS_TAG,
+      messages: [{ role: 'user', content: request.prompt }],
+      ...(request.tier ? { tier: request.tier } : {}),
+      ...(typeof request.taskType === 'string' ? { taskType: request.taskType } : {}),
+      ...(SemanticAnalyzer.currentAgentId ? { agentId: SemanticAnalyzer.currentAgentId } : {}),
+      timeout: request.timeout ?? DEFAULT_TIMEOUT_MS,
+      // Forwarded, not defaulted: an omitted budget must keep meaning
+      // "whatever the proxy decides".
+      ...(typeof request.maxTokens === 'number' ? { maxTokens: request.maxTokens } : {}),
+    });
+    return {
+      content: result.content,
+      provider: result.provider,
+      model: result.model,
+      tokens: result.tokens,
+    };
   }
 
   /**
@@ -377,13 +369,7 @@ export class SemanticAnalyzer {
     if (result.provider === 'mock') confidence = 0.85;
 
     // Record actual mode
-    if (result.mock) {
-      SemanticAnalyzer.recordActualMode('mock');
-    } else if (result.local) {
-      SemanticAnalyzer.recordActualMode('local');
-    } else {
-      SemanticAnalyzer.recordActualMode('public');
-    }
+    SemanticAnalyzer.recordActualMode(result.mock ? 'mock' : 'public');
 
     return {
       insights: result.content,
@@ -399,7 +385,9 @@ export class SemanticAnalyzer {
   }
 
   /**
-   * Determine tier from task type (public method used by external agents)
+   * Determine tier from task type (public method used by external agents).
+   * The tier is sent to the proxy and logged, but does not pick the model:
+   * the `process` route's band does.
    */
   getTierForTask(taskType?: TaskType): ModelTier {
     if (!taskType) return 'standard';
@@ -410,16 +398,13 @@ export class SemanticAnalyzer {
       return envTier;
     }
 
-    // Delegate to LLM service registry
-    return this.llmService.getTierForTask(taskType) || 'standard';
+    return 'standard';
   }
 
   // --- Core Analysis Methods ---
 
   async analyzeContent(content: string, options: AnalysisOptions = {}): Promise<AnalysisResult> {
     const { context, analysisType = "general", tier, taskType, timeout, maxTokens, process: processTag } = options;
-
-    await this.ensureInitialized();
 
     const llmMode = SemanticAnalyzer.getLLMModeForAgent();
     log(`[LLM-MODE] mode=${llmMode}, agentId=${SemanticAnalyzer.currentAgentId}`, 'info');
@@ -436,66 +421,23 @@ export class SemanticAnalyzer {
       taskType,
     });
 
-    // Phase 52 D-09 strangler swap — when the caller supplies a `process`
-    // tag, route through llmWithProcessComplete (the direct-fetch wrapper
-    // that sets body.process on /api/complete) so token-usage telemetry
-    // attributes the call to a named sub-step instead of the default
-    // 'unknown' bucket. The SDK's MetricsTracker is passed through so
-    // wave-controller.getDetailedCalls() / getLLMMetrics() consumers
-    // (lines 622, 645, 812, 992, 1762) keep seeing every call uniformly.
-    // SDK direct path (below) is preserved as fallback for orphan callers
-    // not yet migrated.
-    //
-    // IMPORTANT: the strangler MUST fire BEFORE the batching short-circuit
-    // below, otherwise diagram/pattern calls (analysisType === 'diagram'
-    // or 'patterns') route to `analyzeContentDirectly` which does NOT read
-    // `options.process` and falls through to `llmService.complete()`,
-    // landing in token_usage.db as `process='unknown'`. Phase 52 Task 5
-    // acceptance-gate failure (27 unknown rows from wave-4 diagram path)
-    // diagnosed this ordering bug.
-    //
-    // NOT in mock mode. This path dials the real proxy and never consults the
-    // mode resolver, so every process-tagged call in a `ukb debug` run was a
-    // real, metered LLM call — logged as "LLM mode fallback: intended=mock,
-    // actual=public", one ~9s call per entity. Mock mode falls through to the
-    // SDK path below, whose mode resolver routes to the mock service.
-    if (llmMode !== 'mock' && typeof processTag === 'string' && processTag.length > 0) {
+    // A process-tagged call skips the batching below: batched calls go
+    // through `analyzeContentDirectly`, which does not read `options.process`,
+    // and would land in token-usage under the default tag instead of the
+    // caller's sub-step (Phase 52 Task 5: 27 such rows from the wave-4
+    // diagram path).
+    if (typeof processTag === 'string' && processTag.length > 0) {
       try {
-        const proxyResult = await llmWithProcessComplete(
-          {
-            process: processTag,
-            messages: [{ role: 'user', content: prompt }],
-            tier: effectiveTier,
-            ...(typeof taskType === 'string' ? { taskType } : {}),
-            ...(SemanticAnalyzer.currentAgentId ? { agentId: SemanticAnalyzer.currentAgentId } : {}),
-            ...(typeof timeout === 'number' ? { timeout } : {}),
-            // Forwarded, not defaulted: an omitted budget must keep meaning
-            // "whatever the proxy decides", which is what every unmigrated
-            // caller already relies on.
-            ...(typeof maxTokens === 'number' ? { maxTokens } : {}),
-          },
-          this.llmService.getMetricsTracker(),
-        );
-
-        // Normalize the wrapper's response into the SDK's LLMCompletionResult
-        // shape so toAnalysisResult() works unchanged. The wrapper's tokens
-        // field already matches the SDK's {total, input?, output?} structure.
-        const completionShape: LLMCompletionResult = {
-          content: proxyResult.content,
-          model: proxyResult.model,
-          provider: proxyResult.provider,
-          tokens: {
-            total: proxyResult.tokens.total,
-            input: proxyResult.tokens.input ?? 0,
-            output: proxyResult.tokens.output ?? 0,
-          },
-          // The proxy fetch path is by definition not the SDK's mock or local
-          // path — wave-analysis production traffic only. recordActualMode
-          // will mark this as 'public' inside toAnalysisResult.
-        } as LLMCompletionResult;
-
-        const analysisResult = this.toAnalysisResult(completionShape);
-        SemanticAnalyzer.recordCallMetrics(analysisResult, prompt?.slice(0, 500), proxyResult.content?.slice(0, 500));
+        const result = await this.complete({
+          prompt,
+          process: processTag,
+          tier: effectiveTier,
+          taskType,
+          timeout,
+          maxTokens,
+        });
+        const analysisResult = this.toAnalysisResult(result);
+        SemanticAnalyzer.recordCallMetrics(analysisResult, prompt?.slice(0, 500), result.content?.slice(0, 500));
         return analysisResult;
       } catch (error: any) {
         log('All LLM providers failed', 'error', { error: error?.message ?? String(error) });
@@ -504,9 +446,7 @@ export class SemanticAnalyzer {
     }
 
     // PERFORMANCE OPTIMIZATION: Use batching for non-urgent requests.
-    // Reached only when no process tag is supplied — process-tagged calls
-    // were strangler-routed above to preserve sub-step token attribution
-    // (Phase 52 Task 5 acceptance-gate fix).
+    // Reached only when no process tag is supplied.
     const shouldBatch = analysisType === "diagram" || analysisType === "patterns";
 
     if (shouldBatch) {
@@ -525,17 +465,16 @@ export class SemanticAnalyzer {
       });
     }
 
-    // Single request: delegate to LLM service
+    // Single request
     try {
-      const result = await this.llmService.complete({
-        messages: [{ role: 'user', content: prompt }],
+      const result = await this.complete({
+        prompt,
         tier: effectiveTier,
-        taskType: taskType,
-        agentId: SemanticAnalyzer.currentAgentId || undefined,
+        taskType,
         // Phase 42.2 Plan 06 follow-up — forward caller-supplied timeout so a
         // stalled proxy connection aborts via AbortSignal.timeout instead of
         // hanging the wave forever (Wave 4 insights regression root cause).
-        ...(typeof timeout === 'number' ? { timeout } : {}),
+        timeout,
       });
 
       const analysisResult = this.toAnalysisResult(result);
@@ -624,15 +563,10 @@ export class SemanticAnalyzer {
   }
 
   private async analyzeContentDirectly(content: string, options: AnalysisOptions = {}): Promise<AnalysisResult> {
-    await this.ensureInitialized();
-
     const { context, analysisType = "general" } = options;
     const prompt = this.buildAnalysisPrompt(content, context, analysisType);
 
-    const result = await this.llmService.complete({
-      messages: [{ role: 'user', content: prompt }],
-      agentId: SemanticAnalyzer.currentAgentId || undefined,
-    });
+    const result = await this.complete({ prompt });
 
     const analysisResult = this.toAnalysisResult(result);
     SemanticAnalyzer.recordCallMetrics(analysisResult, prompt?.slice(0, 500), result.content?.slice(0, 500));

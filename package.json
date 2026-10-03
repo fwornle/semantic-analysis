@@ -19,15 +19,13 @@
     "dev": "npm run build && node dist/index.js",
     "test": "npm run build && node dist/test.js",
     "start:sse": "node dist/sse-server.js",
-    "start:proxy": "node dist/stdio-proxy.js",
-    "postinstall": "node scripts/align-copilot-model-ids.mjs"
+    "start:proxy": "node dist/stdio-proxy.js"
   },
   "dependencies": {
     "@anthropic-ai/sdk": "^0.57.0",
     "@fwornle/km-core": "file:../../lib/km-core/fwornle-km-core-0.1.0.tgz",
     "@google/generative-ai": "^0.24.1",
     "@modelcontextprotocol/sdk": "^1.0.3",
-    "@rapid/llm-proxy": "https://github.com/fwornle/rapid-llm-proxy/releases/download/v1.0.0/rapid-llm-proxy-1.0.0.tgz",
     "@types/cheerio": "^0.22.35",
     "axios": "^1.6.0",
     "cheerio": "^1.0.0-rc.12",

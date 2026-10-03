@@ -398,7 +398,7 @@ export class WaveController {
     }
   }
 
-  /** Convert LLMCallMetrics from @rapid/llm-proxy into TraceLLMCall format */
+  /** Convert an agent's LLMMetricsTracker call log into TraceLLMCall format */
   private convertLLMMetricsToCalls(
     calls: Array<{ provider: string; model: string; inputTokens: number; outputTokens: number; totalTokens: number; latencyMs: number; operationType?: string; timestamp: number; promptPreview?: string; responsePreview?: string }>,
   ): TraceLLMCall[] {

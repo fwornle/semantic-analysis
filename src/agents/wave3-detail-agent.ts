@@ -11,16 +11,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { log } from '../logging.js';
-import { LLMService } from '@rapid/llm-proxy';
 import { isMockLLMEnabled, getMockDelay } from '../mock/llm-mock-service.js';
-import { attachTokenLogger } from '../utils/token-usage-logger.js';
 import type { KGEntity, KGRelation } from './kg-operators.js';
 import type { Wave3Input, WaveAgentOutput, ChildManifestEntry, AnalyzeEntityCodeInput } from '../types/wave-types.js';
 import { SemanticAnalysisAgent } from './semantic-analysis-agent.js';
 import type { CgrQueryCache } from '../services/cgr-query-cache.js';
 import type { CgrObservationBuilder } from '../utils/cgr-observation-builder.js';
 import { toCanonicalEntity, augmentWithCanonical } from './canonical-mapper.js';
-import { createLLMWithProcess } from './llm-with-process.js';
+import { createLLMWithProcess, LLMMetricsTracker } from './llm-with-process.js';
 import { PROCESS_TAGS } from './process-tags.js';
 import { parseLlmJson } from '../utils/parse-llm-json.js';
 import { formatSessionFacts, preserveUnreproducibleEvidence } from '../knowledge/session-facts.js';
@@ -45,8 +43,8 @@ interface L3DiscoveryResponse {
 export class Wave3DetailAgent {
   private repositoryPath: string;
   private team: string;
-  private llmService: LLMService;
-  private llmInitialized: boolean = false;
+  /** This agent's call log, read back by wave-controller for the trace. */
+  private llmMetrics = new LLMMetricsTracker();
   private cgrCache: CgrQueryCache | null;
   private cgrBuilder: CgrObservationBuilder | null;
   /**
@@ -70,33 +68,18 @@ export class Wave3DetailAgent {
   ) {
     this.repositoryPath = repositoryPath;
     this.team = team;
-    this.llmService = new LLMService();
-    // Phase 42 Plan 07 — Surprise #5 fix: CommonJS require() → static ESM import.
-    attachTokenLogger(this.llmService, 'wave3-detail-agent');
     this.cgrCache = cgrCache ?? null;
     this.cgrBuilder = cgrBuilder ?? null;
     this.runId = runId ?? `wave3-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-    // Phase 42.2 Plan 02 Gap 2 — bind tracker so direct-fetch calls also land
-    // in the SDK's metrics tracker (wave-controller's tracer reads from it).
     this.llmWithProcess = createLLMWithProcess(
       WAVE3_PROCESS_TAG,
-      this.llmService.getMetricsTracker(),
+      this.llmMetrics,
     );
   }
 
-  private async ensureLLMInitialized(): Promise<void> {
-    if (!this.llmInitialized) {
-      await this.llmService.initialize();
-      this.llmInitialized = true;
-      const providers = this.llmService.getAvailableProviders();
-      log(`[Wave3Agent] LLMService initialized with providers: ${providers.join(', ')}`, 'info');
-    }
-  }
-
-  /** Return LLM metrics from this agent's LLMService (for tracer) */
+  /** Return this agent's LLM metrics (for tracer) */
   getLLMMetrics(): { providers: string[]; totalTokens: number; totalCalls: number } {
-    const tracker = this.llmService.getMetricsTracker();
-    const calls = tracker.getCalls();
+    const calls = this.llmMetrics.getCalls();
     const providers = [...new Set(calls.map(c => c.model ? `${c.model}@${c.provider}` : c.provider))];
     const totalTokens = calls.reduce((sum, c) => sum + c.totalTokens, 0);
     return { providers, totalTokens, totalCalls: calls.length };
@@ -104,7 +87,7 @@ export class Wave3DetailAgent {
 
   /** Return detailed per-call metrics for trace instrumentation */
   getDetailedCalls(): Array<{ provider: string; model: string; inputTokens: number; outputTokens: number; totalTokens: number; latencyMs: number; operationType?: string; timestamp: number }> {
-    return this.llmService.getMetricsTracker().getCalls();
+    return this.llmMetrics.getCalls();
   }
 
   /**
@@ -158,8 +141,6 @@ export class Wave3DetailAgent {
       }
     } else {
       // Real LLM mode: discover detail entities from code analysis
-      await this.ensureLLMInitialized();
-
       const discoveryResult = await this.discoverL3Details(input, fileContents);
 
       for (const detail of discoveryResult.details) {

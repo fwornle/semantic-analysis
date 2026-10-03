@@ -1,46 +1,33 @@
 /**
- * Phase 42.2 Plan 02 Gap 2 — direct-fetch LLM client that sets `process` on
- * the rapid-llm-proxy `/api/complete` request body.
+ * The semantic-analysis LLM client: every call goes to the rapid-llm-proxy
+ * daemon's `/api/complete` with an explicit `process` tag.
  *
- * Why this exists: the `@rapid/llm-proxy` SDK's `LLMService.complete()` does
- * not expose a `process` field (verified at
- * `_work/rapid-llm-proxy/src/types.ts:35-54` — LLMCompletionRequest has
- * messages/maxTokens/temperature/operationType/taskType/tier/agentId, but no
- * process). The proxy server reads `body.process` and defaults to `'unknown'`
- * when absent (`_work/rapid-llm-proxy/proxy-bridge/server.mjs:1561`). Without
- * `process`, every wave-analysis LLM call lands in token-usage telemetry as
- * `process='unknown'`, breaking operator per-step attribution.
+ * Why there is no SDK: semantic-analysis used to embed `@rapid/llm-proxy`'s
+ * in-process `LLMService` — its own provider chain, tier table and model ids,
+ * a frozen v1 copy that drifted from the running daemon (retired Copilot model
+ * ids, a broken comment the Dockerfile had to patch). Since the T2 egress
+ * lockdown the container holds no provider keys, so that chain could only ever
+ * reach models through the daemon anyway. Routing is now decided in ONE place:
+ * the daemon reads `body.process`, looks up the `bg-<process>` route in
+ * `llm-routing.yaml`, and owns provider, band, fallback and token accounting.
+ * A call without `process` lands in token-usage as `process='unknown'` and is
+ * routed by `defaults.background`, so every call site names one.
  *
- * Forensics report `report-42.2-00-canonical-emit.md` §2.3 chose Option B
- * (single-repo wrapper) over Option A (cross-repo SDK release). This module
- * IS Option B — a thin direct-fetch helper mirroring the canonical client
- * pattern at `scripts/backfill-raw-observations.mjs:63,95`.
+ * What the SDK did that callers still need lives here:
+ *   - `LLMMetricsTracker` — the per-agent call log wave-controller reads via
+ *     `getLLMMetrics()` / `getDetailedCalls()` for the workflow trace.
+ *   - An SDK-shaped response (`{ content, model, provider, tokens: { total,
+ *     input?, output? }, latencyMs }`), mapped from the proxy's reply.
+ *   - Mock mode is the CALLER's concern (`isMockLLMEnabled` / the
+ *     SemanticAnalyzer mode resolver): this client always dials the daemon.
  *
- * Design decisions:
- *   - Keeps the SDK's `LLMService` alive for metrics (wave1/2/3 agents call
- *     `getMetricsTracker()` for tracer instrumentation per
- *     wave1-project-agent.ts:79-88). This wrapper PARALLELS the SDK; it does
- *     not replace it.
- *   - Returns a response shape compatible with what the existing call-sites
- *     expect from `llmService.complete()`: `{ content, model, provider,
- *     tokens: { total, ... }, latencyMs }`. Maps the proxy's flat
- *     `{tokens: number}` into the SDK's `{tokens: { total: number, ... }}`
- *     shape so downstream code (`result.tokens.total`) keeps working.
- *   - Honors CLAUDE.md `/api/complete` request body shape:
- *     `{ process, messages, taskType? }`. Server-side at port 3033 (per
- *     CLAUDE.md `km-core LLM proxy endpoint`).
- *   - No `console.*` — uses `process.stderr.write` if logging needed.
+ * No `console.*` — callers log through `../logging.js`.
  *
  * @module agents/llm-with-process
  */
 
-/** Minimal interface for an SDK MetricsTracker — duck-typed so this module
- *  has no compile-time dependency on `@rapid/llm-proxy`. When a wave-agent
- *  passes its `llmService.getMetricsTracker()` here, the wrapper records the
- *  proxy-fetch call into the same tracker the SDK uses, so existing
- *  `wave1Agent.getDetailedCalls()` and `getLLMMetrics()` consumers in
- *  wave-controller.ts (lines 622, 645, 812, 992, 1762) keep working
- *  unchanged. */
+/** Anything that can record a completed call — `LLMMetricsTracker` below,
+ *  or a test double. */
 export interface MetricsTrackerLike {
   recordCall(
     provider: string,
@@ -53,15 +40,75 @@ export interface MetricsTrackerLike {
   ): void;
 }
 
-/** Subset of LLMCompletionRequest the wave-agent call-sites use today. */
+/** One recorded call, the shape wave-controller turns into a trace entry. */
+export interface LLMCallRecord {
+  provider: string;
+  model: string;
+  inputTokens: number;
+  outputTokens: number;
+  totalTokens: number;
+  latencyMs: number;
+  operationType?: string;
+  timestamp: number;
+  promptPreview?: string;
+  responsePreview?: string;
+}
+
+/** Per-agent call log. Each wave agent owns one, passes it to
+ *  `createLLMWithProcess`, and reads it back for the workflow trace. */
+export class LLMMetricsTracker implements MetricsTrackerLike {
+  private calls: LLMCallRecord[] = [];
+
+  recordCall(
+    provider: string,
+    model: string,
+    tokens: { input: number; output: number; total: number },
+    latencyMs: number,
+    operationType?: string,
+    promptPreview?: string,
+    responsePreview?: string,
+  ): void {
+    this.calls.push({
+      provider,
+      model,
+      inputTokens: tokens.input,
+      outputTokens: tokens.output,
+      totalTokens: tokens.total,
+      latencyMs,
+      operationType,
+      timestamp: Date.now(),
+      promptPreview,
+      responsePreview,
+    });
+  }
+
+  getCalls(): LLMCallRecord[] {
+    return [...this.calls];
+  }
+
+  getProviders(): string[] {
+    return [...new Set(this.calls.map((c) => c.provider))];
+  }
+
+  getTotalTokens(): number {
+    return this.calls.reduce((sum, c) => sum + c.totalTokens, 0);
+  }
+
+  reset(): void {
+    this.calls = [];
+  }
+}
+
+/** The request every call site sends. */
 export interface LLMWithProcessRequest {
   /** Required: free-form telemetry tag set into `body.process` so the proxy
    *  stores per-call attribution in `.data/llm-proxy/token-usage.db`. */
   process: string;
   /** Standard OpenAI-style messages array. */
-  messages: Array<{ role: string; content: string }>;
-  /** Optional: routing hint that the local proxy uses for taskType-based
-   *  provider selection (per CLAUDE.md). */
+  messages: Array<{ role: 'system' | 'user' | 'assistant'; content: string }>;
+  /** Optional: task label, recorded as the trace entry's operation type.
+   *  The proxy does not route on it — only `process` (and its route's band)
+   *  decides the model. */
   taskType?: string;
   /** Optional: per-agent attribution label distinct from `process`. */
   agentId?: string;
@@ -79,8 +126,7 @@ export interface LLMWithProcessRequest {
   responseFormat?: Record<string, unknown>;
 }
 
-/** Response shape compatible with the existing `llmService.complete()`
- *  return type that wave-agent call-sites consume. */
+/** SDK-shaped response, so call sites read `result.tokens.total` etc. */
 export interface LLMWithProcessResponse {
   /** LLM-generated text content (matches SDK shape). */
   content: string;
@@ -88,8 +134,8 @@ export interface LLMWithProcessResponse {
   model: string;
   /** Resolved provider name from the proxy (e.g. `copilot`, `claude-code`). */
   provider: string;
-  /** Token usage — SDK shape uses `{ total, input?, output? }`. */
-  tokens: { total: number; input?: number; output?: number };
+  /** Token usage — 0 for any count the proxy did not report. */
+  tokens: { total: number; input: number; output: number };
   /** End-to-end latency in milliseconds. */
   latencyMs: number;
 }
@@ -101,10 +147,10 @@ export interface LLMWithProcessResponse {
 // pre-configured with the `LLM_CLI_PROXY_URL=http://host.docker.internal:12435`
 // env var by docker/docker-compose.yml.
 //
-// Resolution order matches the SDK's `cli-provider-base.ts` convention:
+// Resolution order (the same everywhere in coding — see CLAUDE.md):
 //   1. RAPID_LLM_PROXY_URL (explicit override for this wrapper)
 //   2. LLM_CLI_PROXY_URL (container/host-wide env, set in docker-compose.yml)
-//   3. LLM_PROXY_URL (alternate name used by `proxy-provider.ts`)
+//   3. LLM_PROXY_URL (older alternate name)
 //   4. `http://localhost:<LLM_CLI_PROXY_PORT>` (port-only override; default 12435)
 //
 // Every consumer URL gets `/api/complete` appended exactly once.
@@ -122,14 +168,12 @@ function resolveProxyCompleteUrl(): string {
 
 /**
  * Call the rapid-llm-proxy `/api/complete` endpoint with an explicit `process`
- * tag in the request body. Returns an SDK-shape response so the wave-agent
- * call-sites don't need any other downstream changes.
+ * tag in the request body. Returns an SDK-shape response.
  *
- * Throws on non-2xx HTTP responses (matches the SDK's throw-on-error contract).
+ * Throws on non-2xx HTTP responses.
  *
  * Optionally records the call into a passed-in MetricsTrackerLike (typically
- * the agent's `llmService.getMetricsTracker()`) so wave-controller's tracer
- * instrumentation (`getDetailedCalls()`) keeps seeing the call.
+ * the agent's `LLMMetricsTracker`) so wave-controller's trace sees the call.
  */
 export async function llmWithProcessComplete(
   request: LLMWithProcessRequest,
@@ -177,17 +221,17 @@ export async function llmWithProcessComplete(
   // Normalize the proxy's flat `{tokens: number}` into the SDK shape that
   // wave-agent call-sites read as `result.tokens.total`. Falls back to 0 when
   // the proxy returns no token usage info.
-  let tokens: { total: number; input?: number; output?: number };
+  let tokens: { total: number; input: number; output: number };
   if (typeof parsed.tokens === 'number') {
-    tokens = { total: parsed.tokens };
+    tokens = { total: parsed.tokens, input: 0, output: 0 };
   } else if (parsed.tokens && typeof parsed.tokens === 'object') {
     tokens = {
       total: typeof parsed.tokens.total === 'number' ? parsed.tokens.total : 0,
-      ...(typeof parsed.tokens.input === 'number' ? { input: parsed.tokens.input } : {}),
-      ...(typeof parsed.tokens.output === 'number' ? { output: parsed.tokens.output } : {}),
+      input: typeof parsed.tokens.input === 'number' ? parsed.tokens.input : 0,
+      output: typeof parsed.tokens.output === 'number' ? parsed.tokens.output : 0,
     };
   } else {
-    tokens = { total: 0 };
+    tokens = { total: 0, input: 0, output: 0 };
   }
 
   const response: LLMWithProcessResponse = {
@@ -199,22 +243,18 @@ export async function llmWithProcessComplete(
       typeof parsed.latencyMs === 'number' ? parsed.latencyMs : Date.now() - startedAt,
   };
 
-  // Record into SDK metrics tracker if provided — keeps wave-controller's
-  // tracer instrumentation (getDetailedCalls / getLLMMetrics) seeing every
-  // call uniformly regardless of which client surface (SDK vs this wrapper)
-  // dispatched it.
+  // Record into the caller's tracker — wave-controller's trace reads every
+  // call from there (getDetailedCalls / getLLMMetrics).
   if (metricsTracker) {
     try {
       metricsTracker.recordCall(
         response.provider,
         response.model,
-        {
-          input: response.tokens.input ?? 0,
-          output: response.tokens.output ?? 0,
-          total: response.tokens.total,
-        },
+        response.tokens,
         response.latencyMs,
         request.taskType ?? request.process,
+        request.messages[request.messages.length - 1]?.content?.slice(0, 500),
+        response.content.slice(0, 500),
       );
     } catch {
       // Metrics recording is best-effort — never fail the LLM call because
@@ -229,9 +269,8 @@ export async function llmWithProcessComplete(
  *  once and return a partial client. Each wave-agent constructs its own
  *  (`process='wave-analysis-wave1'` etc.) so call-sites don't repeat the tag.
  *
- *  Pass the agent's `llmService.getMetricsTracker()` so SDK-side
- *  `getDetailedCalls()` consumers still see the calls — Phase 42.2-02 Gap 2
- *  preserves the trace-instrumentation contract.
+ *  Pass the agent's `LLMMetricsTracker` so its `getDetailedCalls()`
+ *  consumers see the calls.
  *
  *  Phase 52 D-06 — the returned `complete()` accepts an optional per-call
  *  `process` override that, when set, supersedes the construction-time

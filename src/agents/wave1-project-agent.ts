@@ -18,9 +18,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { log } from '../logging.js';
-import { LLMService } from '@rapid/llm-proxy';
 import { isMockLLMEnabled, getMockDelay } from '../mock/llm-mock-service.js';
-import { attachTokenLogger } from '../utils/token-usage-logger.js';
 import type { KGEntity, KGRelation } from './kg-operators.js';
 import type { ComponentManifest, ComponentManifestEntry } from '../types/component-manifest.js';
 import type { Wave1Input, WaveAgentOutput, ChildManifestEntry, EntityTraceData } from '../types/wave-types.js';
@@ -28,7 +26,7 @@ import type { CgrQueryCache } from '../services/cgr-query-cache.js';
 import type { CgrObservationBuilder } from '../utils/cgr-observation-builder.js';
 import { SemanticAnalysisAgent } from './semantic-analysis-agent.js';
 import { toCanonicalEntity, augmentWithCanonical } from './canonical-mapper.js';
-import { createLLMWithProcess } from './llm-with-process.js';
+import { createLLMWithProcess, LLMMetricsTracker } from './llm-with-process.js';
 import { PROCESS_TAGS } from './process-tags.js';
 import { parseLlmJson } from '../utils/parse-llm-json.js';
 import { formatSessionFacts, preserveUnreproducibleEvidence, type SessionFact } from '../knowledge/session-facts.js';
@@ -51,8 +49,8 @@ const WAVE1_PROCESS_TAG = 'wave-analysis-wave1';
 export class Wave1ProjectAgent {
   private repositoryPath: string;
   private team: string;
-  private llmService: LLMService;
-  private llmInitialized: boolean = false;
+  /** This agent's call log, read back by wave-controller for the trace. */
+  private llmMetrics = new LLMMetricsTracker();
   private cgrCache: CgrQueryCache | null;
   private cgrBuilder: CgrObservationBuilder | null;
   /**
@@ -63,10 +61,8 @@ export class Wave1ProjectAgent {
    */
   private runId: string;
 
-  /** Phase 42.2 Plan 02 Gap 2 — direct-fetch wrapper that sets `body.process`
-   *  on every wave1 LLM call (the SDK's LLMService does not expose `process`).
-   *  Records into the same metrics tracker the SDK uses so trace
-   *  instrumentation (wave-controller.getDetailedCalls) is unaffected. */
+  /** Phase 42.2 Plan 02 Gap 2 — direct-fetch client that sets `body.process`
+   *  on every wave1 LLM call and records into `llmMetrics`. */
   private llmWithProcess: ReturnType<typeof createLLMWithProcess>;
 
   constructor(
@@ -78,33 +74,18 @@ export class Wave1ProjectAgent {
   ) {
     this.repositoryPath = repositoryPath;
     this.team = team;
-    this.llmService = new LLMService();
-    // Phase 42 Plan 07 — Surprise #5 fix: CommonJS require() → static ESM import.
-    attachTokenLogger(this.llmService, 'wave1-project-agent');
     this.cgrCache = cgrCache ?? null;
     this.cgrBuilder = cgrBuilder ?? null;
     this.runId = runId ?? `wave1-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-    // Phase 42.2 Plan 02 Gap 2 — bind tracker so direct-fetch calls also land
-    // in the SDK's metrics tracker (wave-controller's tracer reads from it).
     this.llmWithProcess = createLLMWithProcess(
       WAVE1_PROCESS_TAG,
-      this.llmService.getMetricsTracker(),
+      this.llmMetrics,
     );
   }
 
-  private async ensureLLMInitialized(): Promise<void> {
-    if (!this.llmInitialized) {
-      await this.llmService.initialize();
-      this.llmInitialized = true;
-      const providers = this.llmService.getAvailableProviders();
-      log(`[Wave1ProjectAgent] LLMService initialized with providers: ${providers.join(', ')}`, 'info');
-    }
-  }
-
-  /** Return LLM metrics from this agent's LLMService (for tracer) */
+  /** Return this agent's LLM metrics (for tracer) */
   getLLMMetrics(): { providers: string[]; totalTokens: number; totalCalls: number } {
-    const tracker = this.llmService.getMetricsTracker();
-    const calls = tracker.getCalls();
+    const calls = this.llmMetrics.getCalls();
     const providers = [...new Set(calls.map(c => c.model ? `${c.model}@${c.provider}` : c.provider))];
     const totalTokens = calls.reduce((sum, c) => sum + c.totalTokens, 0);
     return { providers, totalTokens, totalCalls: calls.length };
@@ -112,7 +93,7 @@ export class Wave1ProjectAgent {
 
   /** Return detailed per-call metrics for trace instrumentation */
   getDetailedCalls(): Array<{ provider: string; model: string; inputTokens: number; outputTokens: number; totalTokens: number; latencyMs: number; operationType?: string; timestamp: number }> {
-    return this.llmService.getMetricsTracker().getCalls();
+    return this.llmMetrics.getCalls();
   }
 
   // --------------------------------------------------------------------------
@@ -129,9 +110,6 @@ export class Wave1ProjectAgent {
     });
 
     const isMock = isMockLLMEnabled(this.repositoryPath);
-    if (!isMock) {
-      await this.ensureLLMInitialized();
-    }
 
     const onPhase = input.onPhase;
 
@@ -452,7 +430,7 @@ ${sessionSection}
 
    GOOD observations (follow this style):
    - "Uses GraphDatabaseAdapter (storage/graph-database-adapter.ts) for Graphology+LevelDB persistence with automatic JSON export sync"
-   - "Wave agents follow constructor(repoPath, team) + ensureLLMInitialized() + execute(input) pattern for lazy LLM initialization"
+   - "Wave agents follow constructor(repoPath, team) + execute(input) pattern, each recording its LLM calls in an LLMMetricsTracker the wave controller reads back"
    - "Implements work-stealing concurrency via shared atomic index counter in runWithConcurrency() (wave-controller.ts:489)"
 
    BAD observations (DO NOT write these):
