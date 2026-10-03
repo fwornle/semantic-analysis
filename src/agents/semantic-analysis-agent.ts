@@ -4,9 +4,8 @@ import { log } from '../logging.js';
 import type { IntelligentQueryResult } from './code-graph-agent.js';
 import { SemanticAnalyzer } from './semantic-analyzer.js';
 import { isMockLLMEnabled, getMockDelay } from '../mock/llm-mock-service.js';
-import { LLMService } from '@rapid/llm-proxy';
+import { createLLMWithProcess } from './llm-with-process.js';
 import type { AnalyzeEntityCodeInput, AnalyzeEntityCodeResult, AnalysisArtifacts, EntityTraceData } from '../types/wave-types.js';
-import { attachTokenLogger } from '../utils/token-usage-logger.js';
 
 export interface CodeFile {
   path: string;
@@ -66,24 +65,13 @@ export interface SemanticAnalysisResult {
 }
 
 export class SemanticAnalysisAgent {
-  private llmService: LLMService;
-  private llmInitialized: boolean = false;
+  /** Calls the proxy daemon as `wave-analysis-sem-analyze`, the route that
+   *  picks this agent's model. */
+  private llm = createLLMWithProcess('wave-analysis-sem-analyze');
   private repositoryPath: string;
 
   constructor(repositoryPath: string = '.') {
     this.repositoryPath = repositoryPath;
-    this.llmService = new LLMService();
-    // Phase 42 Plan 07 — Surprise #5 fix: CommonJS require() → static ESM import.
-    attachTokenLogger(this.llmService, 'semantic-analysis-agent');
-  }
-
-  private async ensureLLMInitialized(): Promise<void> {
-    if (!this.llmInitialized) {
-      await this.llmService.initialize();
-      this.llmInitialized = true;
-      const providers = this.llmService.getAvailableProviders();
-      log(`SemanticAnalysisAgent LLMService initialized with providers: ${providers.join(', ')}`, 'info');
-    }
   }
 
   async analyzeGitAndVibeData(
@@ -786,18 +774,6 @@ export class SemanticAnalysisAgent {
     crossAnalysis: any,
     codeGraph?: any
   ): Promise<SemanticAnalysisResult['semanticInsights']> {
-    // Ensure LLMService is initialized
-    await this.ensureLLMInitialized();
-
-    const providers = this.llmService.getAvailableProviders();
-    if (providers.length === 0) {
-      throw new Error(
-        `SemanticAnalysisAgent: No LLM providers available - cannot generate quality insights.\n\n` +
-        `Configure at least one provider via API keys or subscription CLI.\n` +
-        `See config/llm-providers.yaml for provider priority configuration.`
-      );
-    }
-
     return await this.generateLLMInsights(codeFiles, gitAnalysis, vibeAnalysis, crossAnalysis, codeGraph);
   }
 
@@ -848,7 +824,7 @@ export class SemanticAnalysisAgent {
       // Use unified LLM service with automatic provider chain and fallback
       // Explicit tier: 'standard' — the prompt is large (12-17KB) and copilot proxy
       // times out at 120s, so task_provider_priority routes to groq first
-      const result = await this.llmService.complete({
+      const result = await this.llm.complete({
         messages: [{ role: 'user', content: analysisPrompt }],
         taskType: 'semantic_code_analysis',
         agentId: 'semantic_analysis',
@@ -1364,14 +1340,14 @@ QUALITY RULES:
         fullPrompt = `${context.context}\n\n${content}`;
       }
 
-      // Call LLM via unified LLMService
-      await this.ensureLLMInitialized();
-      const result = await this.llmService.complete({
+      // Call LLM via the proxy daemon
+      const result = await this.llm.complete({
         messages: [{ role: 'user', content: fullPrompt }],
         taskType: 'content_analysis',
         agentId: 'semantic_analysis',
         maxTokens: 4096,
         temperature: 0.7,
+        timeout: 120_000,
       });
 
       const response = result.content;
@@ -1753,13 +1729,13 @@ Respond with a JSON array where each element has:
 }`;
 
     try {
-      await this.ensureLLMInitialized();
-      const result = await this.llmService.complete({
+      const result = await this.llm.complete({
         messages: [{ role: 'user', content: prompt }],
         taskType: 'docstring_analysis',
         agentId: 'semantic_analysis',
         maxTokens: 4096,
         temperature: 0.3,
+        timeout: 120_000,
       });
 
       const response = result.content;
@@ -1867,13 +1843,13 @@ Extract and respond with JSON:
 }`;
 
     try {
-      await this.ensureLLMInitialized();
-      const result = await this.llmService.complete({
+      const result = await this.llm.complete({
         messages: [{ role: 'user', content: prompt }],
         taskType: 'document_analysis',
         agentId: 'semantic_analysis',
         maxTokens: 2048,
         temperature: 0.3,
+        timeout: 120_000,
       });
 
       const response = result.content;
@@ -1921,7 +1897,6 @@ Extract and respond with JSON:
    * @throws Error if LLM call fails (caller handles fallback)
    */
   async analyzeEntityCode(input: AnalyzeEntityCodeInput): Promise<AnalyzeEntityCodeResult> {
-    await this.ensureLLMInitialized();
     const startTime = Date.now();
 
     // Read code file contents (limit to 5 files, 300 lines each)
@@ -1994,7 +1969,7 @@ Setting evidenceGap TRUE is a correct and useful answer, not a failure. File ret
 Respond ONLY with a JSON object. Do not include markdown fences or any text outside the JSON.`;
 
     // Make LLM call
-    const result = await this.llmService.complete({
+    const result = await this.llm.complete({
       messages: [{ role: 'user', content: prompt }],
       taskType: 'semantic_analysis',
       agentId: 'semantic_analysis_entity',

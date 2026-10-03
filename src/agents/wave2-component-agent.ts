@@ -13,16 +13,14 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { log } from '../logging.js';
-import { LLMService } from '@rapid/llm-proxy';
 import { isMockLLMEnabled, getMockDelay } from '../mock/llm-mock-service.js';
-import { attachTokenLogger } from '../utils/token-usage-logger.js';
 import type { KGEntity, KGRelation } from './kg-operators.js';
 import type { Wave2Input, WaveAgentOutput, ChildManifestEntry, AnalyzeEntityCodeInput } from '../types/wave-types.js';
 import { SemanticAnalysisAgent } from './semantic-analysis-agent.js';
 import type { CgrQueryCache } from '../services/cgr-query-cache.js';
 import type { CgrObservationBuilder } from '../utils/cgr-observation-builder.js';
 import { toCanonicalEntity, augmentWithCanonical } from './canonical-mapper.js';
-import { createLLMWithProcess } from './llm-with-process.js';
+import { createLLMWithProcess, LLMMetricsTracker } from './llm-with-process.js';
 import { PROCESS_TAGS } from './process-tags.js';
 import { parseLlmJson } from '../utils/parse-llm-json.js';
 import { formatSessionFacts, preserveUnreproducibleEvidence } from '../knowledge/session-facts.js';
@@ -52,8 +50,8 @@ interface L2AnalysisResponse {
 export class Wave2ComponentAgent {
   private repositoryPath: string;
   private team: string;
-  private llmService: LLMService;
-  private llmInitialized: boolean = false;
+  /** This agent's call log, read back by wave-controller for the trace. */
+  private llmMetrics = new LLMMetricsTracker();
   private cgrCache: CgrQueryCache | null;
   private cgrBuilder: CgrObservationBuilder | null;
 
@@ -78,33 +76,18 @@ export class Wave2ComponentAgent {
   ) {
     this.repositoryPath = repositoryPath;
     this.team = team;
-    this.llmService = new LLMService();
-    // Phase 42 Plan 07 — Surprise #5 fix: CommonJS require() → static ESM import.
-    attachTokenLogger(this.llmService, 'wave2-component-agent');
     this.cgrCache = cgrCache ?? null;
     this.cgrBuilder = cgrBuilder ?? null;
     this.runId = runId ?? `wave2-${new Date().toISOString().replace(/[:.]/g, '-')}`;
-    // Phase 42.2 Plan 02 Gap 2 — bind tracker so direct-fetch calls also land
-    // in the SDK's metrics tracker (wave-controller's tracer reads from it).
     this.llmWithProcess = createLLMWithProcess(
       WAVE2_PROCESS_TAG,
-      this.llmService.getMetricsTracker(),
+      this.llmMetrics,
     );
   }
 
-  private async ensureLLMInitialized(): Promise<void> {
-    if (!this.llmInitialized) {
-      await this.llmService.initialize();
-      this.llmInitialized = true;
-      const providers = this.llmService.getAvailableProviders();
-      log(`[Wave2Agent] LLMService initialized with providers: ${providers.join(', ')}`, 'info');
-    }
-  }
-
-  /** Return LLM metrics from this agent's LLMService (for tracer) */
+  /** Return this agent's LLM metrics (for tracer) */
   getLLMMetrics(): { providers: string[]; totalTokens: number; totalCalls: number } {
-    const tracker = this.llmService.getMetricsTracker();
-    const calls = tracker.getCalls();
+    const calls = this.llmMetrics.getCalls();
     const providers = [...new Set(calls.map(c => c.model ? `${c.model}@${c.provider}` : c.provider))];
     const totalTokens = calls.reduce((sum, c) => sum + c.totalTokens, 0);
     return { providers, totalTokens, totalCalls: calls.length };
@@ -112,7 +95,7 @@ export class Wave2ComponentAgent {
 
   /** Return detailed per-call metrics for trace instrumentation */
   getDetailedCalls(): Array<{ provider: string; model: string; inputTokens: number; outputTokens: number; totalTokens: number; latencyMs: number; operationType?: string; timestamp: number }> {
-    return this.llmService.getMetricsTracker().getCalls();
+    return this.llmMetrics.getCalls();
   }
 
   /**
@@ -178,8 +161,6 @@ export class Wave2ComponentAgent {
       }
     } else {
       // Real LLM mode: analyze files and discover sub-components
-      await this.ensureLLMInitialized();
-
       const analysisResult = await this.analyzeL2Components(input, fileContents);
 
       // Build L2 entities from LLM analysis with observation validation

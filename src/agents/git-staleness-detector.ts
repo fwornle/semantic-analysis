@@ -5,7 +5,7 @@
  * Uses a three-tier matching strategy:
  *   TIER 1: Fast file-path matching (free, ~1ms)
  *   TIER 2: Hybrid keyword + embedding matching (cached)
- *   TIER 3: LLM correlation via LLMService (batched, provider auto-selected)
+ *   TIER 3: LLM correlation via the proxy daemon (batched, model picked by its route)
  *
  * Inspired by Graphiti's bi-temporal model for tracking knowledge freshness.
  */
@@ -14,11 +14,10 @@ import * as path from "path";
 import * as crypto from "crypto";
 import OpenAI from "openai";
 import { log } from "../logging.js";
-import { LLMService } from '@rapid/llm-proxy';
+import { createLLMWithProcess } from './llm-with-process.js';
 import type { GitCommit, GitFileChange } from "./git-history-agent.js";
 import { EmbeddingCache, getSharedEmbeddingCache } from "../utils/embedding-cache.js";
 import { isMockLLMEnabled, getMockDelay } from "../mock/llm-mock-service.js";
-import { attachTokenLogger } from "../utils/token-usage-logger.js";
 
 // ============================================================================
 // Interfaces
@@ -78,9 +77,9 @@ export interface StalenessConfig {
 
 export class GitStalenessDetector {
   private config: StalenessConfig;
-  private llmService: LLMService;
-  private llmInitialized: boolean = false;
-  private openaiClient: OpenAI | null = null;  // Kept for embeddings (LLMService doesn't support embeddings)
+  /** TIER 3 correlation calls the proxy daemon as `wave-analysis-staleness`. */
+  private llm = createLLMWithProcess('wave-analysis-staleness');
+  private openaiClient: OpenAI | null = null;  // For embeddings (TIER 2), via the proxy's /v1/embeddings
   private embeddingCache: EmbeddingCache;
 
   // Patterns for extracting references from observations
@@ -102,27 +101,12 @@ export class GitStalenessDetector {
 
     // Use shared disk-backed embedding cache
     this.embeddingCache = getSharedEmbeddingCache();
-    this.llmService = new LLMService();
-    // Phase 42 Plan 07 — Surprise #5 fix: CommonJS require() → static ESM import.
-    attachTokenLogger(this.llmService, 'git-staleness-detector');
     this.initializeClients();
   }
 
-  private async ensureLLMInitialized(): Promise<void> {
-    if (!this.llmInitialized) {
-      await this.llmService.initialize();
-      this.llmInitialized = true;
-      const providers = this.llmService.getAvailableProviders();
-      log(`GitStalenessDetector: LLMService initialized with providers: ${providers.join(', ')}`, 'info');
-    }
-  }
-
   private initializeClients(): void {
-    // LLMService handles TIER 3 LLM correlation (replaces direct Groq client)
-    // It will be lazily initialized on first use via ensureLLMInitialized()
-
-    // Initialize OpenAI for embeddings (TIER 2) - kept as direct client
-    // since LLMService doesn't support embedding generation.
+    // Initialize OpenAI for embeddings (TIER 2) - a direct client, since
+    // `/api/complete` does not generate embeddings.
     // T2 egress lockdown: inside the container there is no raw OPENAI_API_KEY;
     // embeddings route through the host proxy's /v1/embeddings passthrough.
     const proxyUrl = process.env.LLM_CLI_PROXY_URL;
@@ -213,7 +197,7 @@ export class GitStalenessDetector {
       }
     }
 
-    // TIER 3: LLM correlation for uncertain cases (via LLMService)
+    // TIER 3: LLM correlation for uncertain cases (via the proxy daemon)
     if (uncertainPairs.length > 0) {
       log(`Running TIER 3 LLM correlation for ${uncertainPairs.length} uncertain pairs`, "info");
       const llmResults = await this.matchByLLM(uncertainPairs);
@@ -573,7 +557,7 @@ export class GitStalenessDetector {
   }
 
   // ============================================================================
-  // TIER 3: LLM Correlation (via LLMService)
+  // TIER 3: LLM Correlation (via the proxy daemon)
   // ============================================================================
 
   private async matchByLLM(
@@ -595,13 +579,6 @@ export class GitStalenessDetector {
       return results;
     }
 
-    try {
-      await this.ensureLLMInitialized();
-    } catch (initError) {
-      log("LLMService initialization failed, skipping TIER 3 LLM correlation", "warning", initError);
-      return results;
-    }
-
     // Batch pairs for efficiency
     const batches = this.chunkArray(pairs, this.config.maxEntitiesPerLlmBatch);
 
@@ -609,7 +586,7 @@ export class GitStalenessDetector {
       try {
         const prompt = this.buildCorrelationPrompt(batch);
 
-        const result = await this.llmService.complete({
+        const result = await this.llm.complete({
           messages: [
             {
               role: 'system',
@@ -624,6 +601,7 @@ export class GitStalenessDetector {
           agentId: 'git_staleness_detector',
           maxTokens: 1000,
           temperature: 0.1,
+          timeout: 120_000,
         });
 
         const content = result.content;
