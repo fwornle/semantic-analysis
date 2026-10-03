@@ -947,8 +947,13 @@ IMPORTANT: Return ONLY the JSON object, no markdown code blocks or surrounding t
     let retryAdded = 0;
     const needed = 3 - specific.length;
 
-    try {
-      const retryPrompt = `You are generating specific observations about the "${entityName}" component.
+    // Not in `ukb debug`: this runs for every L1 entity, mock analysis
+    // included, and the mock's observations routinely fall short of 3 — so
+    // each debug run made one real, metered call per component here.
+    // Mock mode goes straight to the supplement step instead.
+    if (!isMockLLMEnabled(this.repositoryPath)) {
+      try {
+        const retryPrompt = `You are generating specific observations about the "${entityName}" component.
 
 Context:
 - Description: ${context.description}
@@ -965,50 +970,51 @@ GOOD examples:
 
 Return a JSON array of strings, e.g. ["observation 1", "observation 2"]`;
 
-      // Phase 42.2 Plan 02 Gap 2 — route through llmWithProcess for tagged
-      // process attribution on observation-retry.
-      // Phase 52 D-05 — per-call PROCESS_TAGS.WAVE1_L1_EMIT override (same
-      // sub-step as enrich + analyze; observation-retry is a recovery path
-      // for the same emission boundary).
-      const result = await this.llmWithProcess.complete({
-        process: PROCESS_TAGS.WAVE1_L1_EMIT,
-        messages: [{ role: 'user', content: retryPrompt }],
-        taskType: 'observation_retry',
-        agentId: 'wave1_project',
-        tier: 'standard',
-        maxTokens: 512,
-        temperature: 0.7,
-        timeout: 30_000,
-      });
+        // Phase 42.2 Plan 02 Gap 2 — route through llmWithProcess for tagged
+        // process attribution on observation-retry.
+        // Phase 52 D-05 — per-call PROCESS_TAGS.WAVE1_L1_EMIT override (same
+        // sub-step as enrich + analyze; observation-retry is a recovery path
+        // for the same emission boundary).
+        const result = await this.llmWithProcess.complete({
+          process: PROCESS_TAGS.WAVE1_L1_EMIT,
+          messages: [{ role: 'user', content: retryPrompt }],
+          taskType: 'observation_retry',
+          agentId: 'wave1_project',
+          tier: 'standard',
+          maxTokens: 512,
+          temperature: 0.7,
+          timeout: 30_000,
+        });
 
-      let retryObs: string[] = [];
-      try {
-        const parsedResult = parseLlmJson<unknown>(result.content);
-        if (parsedResult.repaired) {
-          log('[Wave1ProjectAgent] Repaired control characters in observation retry', 'debug');
+        let retryObs: string[] = [];
+        try {
+          const parsedResult = parseLlmJson<unknown>(result.content);
+          if (parsedResult.repaired) {
+            log('[Wave1ProjectAgent] Repaired control characters in observation retry', 'debug');
+          }
+          const parsed = parsedResult.value;
+          retryObs = Array.isArray(parsed)
+            ? parsed.filter((o: unknown): o is string => typeof o === 'string')
+            : [];
+        } catch {
+          // Parse failed, skip retry results
         }
-        const parsed = parsedResult.value;
-        retryObs = Array.isArray(parsed)
-          ? parsed.filter((o: unknown): o is string => typeof o === 'string')
-          : [];
-      } catch {
-        // Parse failed, skip retry results
+
+        // Combine and dedup
+        const combined = [...specific, ...retryObs.filter(o => this.isSpecificObservation(o))];
+        const deduped = [...new Set(combined)];
+        retryAdded = deduped.length - specific.length;
+
+        if (deduped.length >= 3) {
+          log(`[Wave1ProjectAgent] Observation validation for ${entityName}: ${initial} -> ${deduped.length} (filtered: ${filtered}, retried: ${retryAdded}, supplemented: 0)`, 'info');
+          return deduped.slice(0, 7);
+        }
+
+        // Update specific with retry results for supplement step
+        specific.push(...deduped.slice(specific.length));
+      } catch (retryError) {
+        log(`[Wave1ProjectAgent] Observation retry failed for ${entityName}: ${retryError instanceof Error ? retryError.message : String(retryError)}`, 'warning');
       }
-
-      // Combine and dedup
-      const combined = [...specific, ...retryObs.filter(o => this.isSpecificObservation(o))];
-      const deduped = [...new Set(combined)];
-      retryAdded = deduped.length - specific.length;
-
-      if (deduped.length >= 3) {
-        log(`[Wave1ProjectAgent] Observation validation for ${entityName}: ${initial} -> ${deduped.length} (filtered: ${filtered}, retried: ${retryAdded}, supplemented: 0)`, 'info');
-        return deduped.slice(0, 7);
-      }
-
-      // Update specific with retry results for supplement step
-      specific.push(...deduped.slice(specific.length));
-    } catch (retryError) {
-      log(`[Wave1ProjectAgent] Observation retry failed for ${entityName}: ${retryError instanceof Error ? retryError.message : String(retryError)}`, 'warning');
     }
 
     // Step 3: Supplement from available data
