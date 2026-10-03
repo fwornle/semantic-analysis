@@ -24,6 +24,7 @@ import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import type { AddressInfo } from 'node:net';
 import { llmWithProcessComplete, createLLMWithProcess, LLMMetricsTracker } from './llm-with-process.js';
+import { withLlmProject } from './llm-project-context.js';
 import { SemanticAnalyzer } from './semantic-analyzer.js';
 
 const bodies: Array<Record<string, unknown>> = [];
@@ -100,6 +101,45 @@ describe('llmWithProcessComplete', () => {
       /HTTP 502/,
     );
     status = 200;
+  });
+});
+
+describe('project attribution (token_usage.project)', () => {
+  const call = (extra: Record<string, unknown> = {}) => llmWithProcessComplete({
+    process: 'wave-analysis-test', messages: [{ role: 'user', content: 'hi' }], ...extra,
+  });
+
+  test('outside a run no project is sent', async () => {
+    bodies.length = 0;
+    await call();
+    assert.equal(bodies[0].project, undefined);
+  });
+
+  test('inside withLlmProject every call carries the run\'s project, however deep', async () => {
+    bodies.length = 0;
+    await withLlmProject('coding', async () => {
+      await call();
+      await new Promise((r) => setTimeout(r, 1));
+      await Promise.all([call(), call()]);
+    });
+    assert.deepEqual(bodies.map((b) => b.project), ['coding', 'coding', 'coding']);
+  });
+
+  test('concurrent runs do not see each other\'s project (the consolidator beside a UKB run)', async () => {
+    bodies.length = 0;
+    await Promise.all([
+      withLlmProject('coding', async () => { await new Promise((r) => setTimeout(r, 5)); await call({ process: 'a' }); }),
+      withLlmProject('rec', async () => { await call({ process: 'b' }); }),
+      call({ process: 'c' }),
+    ]);
+    const by = Object.fromEntries(bodies.map((b) => [b.process, b.project]));
+    assert.deepEqual(by, { a: 'coding', b: 'rec', c: undefined });
+  });
+
+  test('an explicit request.project wins over the run\'s', async () => {
+    bodies.length = 0;
+    await withLlmProject('coding', () => call({ project: 'other' }));
+    assert.equal(bodies[0].project, 'other');
   });
 });
 

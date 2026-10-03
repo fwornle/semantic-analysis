@@ -26,6 +26,8 @@
  * @module agents/llm-with-process
  */
 
+import { currentLlmProject } from './llm-project-context.js';
+
 /** Anything that can record a completed call — `LLMMetricsTracker` below,
  *  or a test double. */
 export interface MetricsTrackerLike {
@@ -112,6 +114,10 @@ export interface LLMWithProcessRequest {
   taskType?: string;
   /** Optional: per-agent attribution label distinct from `process`. */
   agentId?: string;
+  /** Optional: the project (repo id) the call is spent on — the proxy stores
+   *  it as `token_usage.project`. Defaults to the enclosing workflow run's
+   *  project (llm-project-context.ts). */
+  project?: string;
   /** Optional: routing tier (`'standard'` etc). */
   tier?: string;
   /** Optional: per-call token cap. */
@@ -190,6 +196,8 @@ export async function llmWithProcessComplete(
   };
   if (typeof request.taskType === 'string') body.taskType = request.taskType;
   if (typeof request.agentId === 'string') body.agentId = request.agentId;
+  const project = request.project ?? currentLlmProject();
+  if (project) body.project = project;
   if (typeof request.tier === 'string') body.tier = request.tier;
   if (typeof request.maxTokens === 'number') body.maxTokens = request.maxTokens;
   if (typeof request.temperature === 'number') body.temperature = request.temperature;
