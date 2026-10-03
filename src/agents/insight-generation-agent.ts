@@ -191,7 +191,13 @@ export class InsightGenerationAgent {
   constructor(repositoryPath: string = '.') {
     this.repositoryPath = repositoryPath;
     this.outputDir = path.join(repositoryPath, 'knowledge-management', 'insights');
-    this.pumlDir = path.join(repositoryPath, '.data', 'knowledge-graph', 'insights', 'puml');
+    // Sources sit next to their documents: in the coding tools repo
+    // knowledge-management/insights is a symlink into its learning checkout
+    // (.coding/kb/insights, per-repo tenancy T7), so they are versioned with the
+    // documents and their renders, and nothing lands in the tools checkout.
+    // _standard-style.puml lives here too — the sibling include
+    // normaliseStyleInclude forces.
+    this.pumlDir = path.join(this.outputDir, 'puml');
     // Images go into knowledge-management/insights/images/ so markdown relative links (images/X.png) work
     // in both filesystem and VKB viewer contexts
     this.imagesDir = path.join(repositoryPath, 'knowledge-management', 'insights', 'images');
@@ -2455,7 +2461,7 @@ Best practices, rules, and conventions for using this correctly. What should dev
       };
     }
 
-    // Write PlantUML file to new .data/knowledge-graph/insights paths
+    // Write the PlantUML source next to the insight documents (see pumlDir)
     const pumlFile = path.join(this.pumlDir, `${toKebabCase(name)}-${type}.puml`);
 
     try {
