@@ -134,6 +134,14 @@ export class WaveController {
   private docAnalysis: DocumentationAnalysisResult | null = null;
   /** Track all entity names persisted across waves — used for cross-wave parent validation */
   private persistedEntityNames: Set<string> = new Set();
+  /**
+   * Names the constraint gate rejected in THIS run (and no other emission of
+   * the name passed). Wave 4 must not document them: its insight stamp is an
+   * upsert, so it CREATED them — past the gate, with no parent edge. That is
+   * how UsePolledFetchHook and OntologyClassifierFactory (rejected 16:36 on
+   * 2026-10-03 as single-sentence stubs) reached the graph at 16:53, floating.
+   */
+  private rejectedEntityNames: Set<string> = new Set();
 
   /**
    * Name of the Project root every wave-emitted entity ultimately hangs from.
@@ -2275,6 +2283,10 @@ export class WaveController {
     const persistedNames = new Set(qualityFilteredEntities.map(e => e.name));
     for (const name of persistedNames) {
       this.persistedEntityNames.add(name);
+      this.rejectedEntityNames.delete(name);
+    }
+    for (const e of sharedMemoryEntities) {
+      if (!persistedNames.has(e.name)) this.rejectedEntityNames.add(e.name);
     }
 
     // Phase 42 Plan 07 Phase B1 — km-core is the only persistence path.
@@ -2531,7 +2543,14 @@ export class WaveController {
     // edge is not an edge: a relation whose parent failed the constraint gate
     // is skipped here, and marking its target "anchored" is what disarmed the
     // repair pass that exists precisely for this case.
-    const anchoredByStoredEdge = new Set<string>();
+    // child name -> the names it got a contains/parent-child edge FROM this run.
+    const anchoredByStoredEdge = new Map<string, Set<string>>();
+    // The entityType of each name written THIS run. Name resolution is "oldest
+    // namesake wins", so an edge to a new Detail sharing its name with an older
+    // entity landed on the older one — and the new one, marked anchored by NAME,
+    // was skipped by the anchor pass too. 20 of the 29 wave rows found floating
+    // on 2026-10-04 were exactly this (ObservationWriter, MentionsClassifier, …).
+    const runTypeOf = new Map(entities.map((e) => [e.name, e.entityType] as const));
     for (const rel of relationships) {
       if (!this.persistedEntityNames.has(rel.from) || !this.persistedEntityNames.has(rel.to)) {
         relationshipsSkipped += 1;
@@ -2551,10 +2570,12 @@ export class WaveController {
           rel.to,
           rel.type,
           { weight: rel.weight, source: rel.source, batchId: rel.batchId, runId },
+          { from: runTypeOf.get(rel.from), to: runTypeOf.get(rel.to) },
         );
         relationshipsStored += 1;
         if (rel.type === 'contains' || rel.type === 'parent-child') {
-          anchoredByStoredEdge.add(rel.to);
+          if (!anchoredByStoredEdge.has(rel.to)) anchoredByStoredEdge.set(rel.to, new Set());
+          anchoredByStoredEdge.get(rel.to)!.add(rel.from);
         }
       } catch (err) {
         relationshipErrors += 1;
@@ -2588,11 +2609,37 @@ export class WaveController {
     // pass reported `added=0 skipped=N failed=0` for every batch of the
     // 2026-09-07 runs while the entities it skipped had no incoming edge at
     // all.
-    const alreadyAnchored = new Set<string>(anchoredByStoredEdge);
+    const alreadyAnchored = new Set<string>();
 
     // Layer (b) — persisted store. Use the adapter's queryIncomingRelations
     // (Phase 42.1 added). On adapter failure, fall through to the storeRelationship
     // try/catch — duplicates are tolerated by km-core's upsert semantics.
+    // The DECLARED parent, when it exists. "Has some incoming contains edge"
+    // is not "is under its parent": an entity re-parented by a later run kept
+    // its old edge (DashboardServiceWrapper: edge from Coding since Sep 8,
+    // metadata parent ConstraintMonitorServices since Sep 28) and the metadata
+    // and the graph disagreed for good. And the fallback guessed by name
+    // substring, never consulting the declared parent at all.
+    const declaredParentOf = (e: SharedMemoryEntity): string | null => {
+      const p = e.parentEntityName;
+      return p && p !== e.name && this.persistedEntityNames.has(p) ? p : null;
+    };
+    const declaredParentIds = new Map<string, string | null>();
+    const parentIdOf = async (name: string): Promise<string | null> => {
+      if (!declaredParentIds.has(name)) {
+        let id: string | null = null;
+        try { id = ((await this.kmCoreAdapter!.getEntity(name, this.team)) as { id?: string } | undefined)?.id ?? null; } catch { /* unknown */ }
+        declaredParentIds.set(name, id);
+      }
+      return declaredParentIds.get(name) ?? null;
+    };
+
+    for (const e of entities) {
+      const stored = anchoredByStoredEdge.get(e.name);
+      const declared = declaredParentOf(e);
+      if (stored && (declared ? stored.has(declared) : true)) alreadyAnchored.add(e.name);
+    }
+
     for (const e of entities) {
       if (alreadyAnchored.has(e.name)) continue;
       try {
@@ -2603,7 +2650,10 @@ export class WaveController {
         // left in the graph with no edges at all. Every batch that run logged
         // `added=0 skipped=N` — the pass did nothing, and looked like it had.
         const inRels = await this.kmCoreAdapter.queryIncomingRelations(e.name, e.entityType);
-        if (inRels.some((r) => r.type === 'contains' || r.type === 'parent-child')) {
+        const structural = inRels.filter((r) => r.type === 'contains' || r.type === 'parent-child');
+        const declared = declaredParentOf(e);
+        const parentId = declared ? await parentIdOf(declared) : null;
+        if (parentId ? structural.some((r) => String(r.from) === parentId) : structural.length > 0) {
           alreadyAnchored.add(e.name);
         }
       } catch {
@@ -2628,7 +2678,7 @@ export class WaveController {
       // guarantee that never happens, and the team's Project root (minted by
       // ensureProjectAnchor above) is always a valid last-resort parent, so
       // fall back to it rather than giving up.
-      const parent = this.findBestParent(e.name, entities) ?? this.projectAnchorName;
+      const parent = declaredParentOf(e) ?? this.findBestParent(e.name, entities) ?? this.projectAnchorName;
       if (!parent) {
         anchorEdgesSkipped += 1;
         process.stderr.write(
@@ -2905,8 +2955,13 @@ export class WaveController {
   private async generateInsightsForWaveEntities(
     waveResults: WaveResult[],
   ): Promise<{ generated: number; failed: number; skippedDiagrams: number; insightEntitiesStored: number; insightEntityErrors: number }> {
-    // Collect all entities and relationships from all waves
-    const allEntities = waveResults.flatMap(wr => wr.agentOutputs.flatMap(ao => ao.entities));
+    // Collect all entities and relationships from all waves — minus what the
+    // constraint gate rejected (see rejectedEntityNames).
+    const emitted = waveResults.flatMap(wr => wr.agentOutputs.flatMap(ao => ao.entities));
+    const allEntities = emitted.filter(e => !this.rejectedEntityNames.has(e.name));
+    if (allEntities.length < emitted.length) {
+      log(`[WaveController] Insight finalization: ${emitted.length - allEntities.length} gate-rejected entities not documented`, 'info');
+    }
     const allRelationships = waveResults.flatMap(wr => wr.agentOutputs.flatMap(ao => ao.relationships));
 
     log('[WaveController] Starting insight finalization', 'info', {
