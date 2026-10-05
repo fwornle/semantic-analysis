@@ -1,7 +1,7 @@
 import * as fs from 'fs';
 import * as path from 'path';
 import { log } from '../logging.js';
-import { listLslFiles } from '../utils/lsl-discovery.js';
+import { listLslFiles, lslHistoryRoot } from '../utils/lsl-discovery.js';
 import { CheckpointManager } from '../utils/checkpoint-manager.js';
 import { SemanticAnalyzer } from './semantic-analyzer.js';
 
@@ -116,7 +116,7 @@ export class VibeHistoryAgent {
   constructor(repositoryPath: string = '.', team: string = 'coding') {
     this.repositoryPath = repositoryPath;
     this.team = team;
-    this.specstoryPath = path.join(repositoryPath, '.specstory', 'history');
+    this.specstoryPath = lslHistoryRoot(repositoryPath);
     this.semanticAnalyzer = new SemanticAnalyzer();
     this.checkpointManager = new CheckpointManager(repositoryPath);
   }

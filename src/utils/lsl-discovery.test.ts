@@ -26,7 +26,7 @@ import {
 
 function makeTree(): string {
   const root = fs.mkdtempSync(path.join(os.tmpdir(), 'lsl-discovery-'));
-  const hist = path.join(root, '.specstory', 'history');
+  const hist = path.join(root, '.coding', 'history');
   fs.mkdirSync(path.join(hist, '2026', '09'), { recursive: true });
   fs.mkdirSync(path.join(hist, '2025', '11'), { recursive: true });
   fs.mkdirSync(path.join(hist, 'logs'), { recursive: true });
@@ -98,16 +98,35 @@ test('hasLslTranches tells an empty project apart from a broken scanner', () => 
   assert.equal(hasLslTranches(lslHistoryRoot(root)), true);
 
   const bare = fs.mkdtempSync(path.join(os.tmpdir(), 'lsl-bare-'));
-  fs.mkdirSync(path.join(bare, '.specstory', 'history'), { recursive: true });
+  fs.mkdirSync(path.join(bare, '.coding', 'history'), { recursive: true });
   assert.equal(hasLslTranches(lslHistoryRoot(bare)), false);
 });
 
+test('lslHistoryRoot: .coding/history, legacy only while it is real and .coding/ is absent', () => {
+  const repo = fs.mkdtempSync(path.join(os.tmpdir(), 'lsl-root-'));
+  assert.equal(lslHistoryRoot(repo), path.join(repo, '.coding', 'history'));
+
+  const legacy = path.join(repo, '.specstory', 'history');
+  fs.mkdirSync(legacy, { recursive: true });
+  assert.equal(lslHistoryRoot(repo), legacy);
+
+  fs.mkdirSync(path.join(repo, '.coding', 'history'), { recursive: true });
+  assert.equal(lslHistoryRoot(repo), path.join(repo, '.coding', 'history'));
+
+  // The post-T3 symlink is never the answer.
+  const linked = fs.mkdtempSync(path.join(os.tmpdir(), 'lsl-link-'));
+  fs.mkdirSync(path.join(linked, '.coding', 'history'), { recursive: true });
+  fs.mkdirSync(path.join(linked, '.specstory'));
+  fs.symlinkSync('../.coding/history', path.join(linked, '.specstory', 'history'));
+  assert.equal(lslHistoryRoot(linked), path.join(linked, '.coding', 'history'));
+});
+
 test('finds the real corpus — fails if the on-disk layout moves again', () => {
-  // Walk up to the checkout that owns .specstory/history.
+  // Walk up to the checkout that owns a history dir (either layout).
   let dir = process.cwd();
   let found: string | null = null;
   while (dir && dir !== path.dirname(dir)) {
-    if (fs.existsSync(path.join(dir, '.specstory', 'history'))) { found = dir; break; }
+    if (fs.existsSync(lslHistoryRoot(dir))) { found = dir; break; }
     dir = path.dirname(dir);
   }
   if (!found) {

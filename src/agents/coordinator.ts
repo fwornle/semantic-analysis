@@ -1190,7 +1190,6 @@ export class CoordinatorAgent {
             agent: "vibe_history",
             action: "analyzeVibeHistory",
             parameters: {
-              history_path: ".specstory/history",
               checkpoint_enabled: false, // For complete-analysis: analyze ALL sessions
               maxSessions: 0, // 0 = unlimited - process all sessions with parallelization
               skipLlmEnhancement: false // Still generate LLM insights

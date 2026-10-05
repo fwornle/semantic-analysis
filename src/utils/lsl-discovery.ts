@@ -1,7 +1,7 @@
 /**
  * LSL (Live Session Log) discovery — the one place that knows where sessions live.
  *
- * WHY THIS EXISTS. Session logs used to sit flat in `.specstory/history/` and
+ * WHY THIS EXISTS. Session logs used to sit flat in the history root and
  * were written as markdown. They now live in `YYYY/MM/` tranches and are
  * written as `.jsonl`. Two call sites kept their original shape:
  *
@@ -60,9 +60,25 @@ const LSL_EXTENSIONS = ['.jsonl', '.md'];
  */
 const LSL_NAME = /^(\d{4})-(\d{2})-(\d{2})_(\d{2})(\d{2})-/;
 
-/** The history root for a repository checkout. */
+function isRealDir(p: string): boolean {
+  try {
+    const st = fs.lstatSync(p);
+    return st.isDirectory() && !st.isSymbolicLink();
+  } catch {
+    return false;
+  }
+}
+
+/**
+ * The history root for a repository checkout — the same rule as coding's
+ * lib/history/paths.cjs `repoHistoryDir` (T9): `<repo>/.coding/history`, or a
+ * REAL legacy `<repo>/.specstory/history` while the repo has no `.coding/` yet.
+ * Never answers through the legacy symlink.
+ */
 export function lslHistoryRoot(repositoryPath: string): string {
-  return path.join(repositoryPath, '.specstory', 'history');
+  const legacy = path.join(repositoryPath, '.specstory', 'history');
+  if (!isRealDir(path.join(repositoryPath, '.coding')) && isRealDir(legacy)) return legacy;
+  return path.join(repositoryPath, '.coding', 'history');
 }
 
 /**
